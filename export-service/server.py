@@ -33,6 +33,8 @@ app.add_middleware(
 JOBS: dict[str, dict] = {}
 TEMP_ROOT = Path(tempfile.gettempdir()) / "video-export-service"
 TEMP_ROOT.mkdir(exist_ok=True)
+STAGE_DIR = TEMP_ROOT / "staged-media"
+STAGE_DIR.mkdir(exist_ok=True)
 
 ENCODER = "libx264"
 FFMPEG_PATH = "ffmpeg"
@@ -81,6 +83,35 @@ async def health():
     }
 
 
+@app.post("/stage")
+async def stage_files(files: list[UploadFile] = File(...)):
+    """Upload files to a persistent staging directory. Skips files that already exist with the same size."""
+    staged = []
+    for f in files:
+        safe_name = f.filename.replace("/", "_").replace("\\", "_")
+        dest = STAGE_DIR / safe_name
+        content = await f.read()
+        if dest.exists() and dest.stat().st_size == len(content):
+            staged.append({"name": safe_name, "status": "exists", "path": str(dest)})
+        else:
+            with open(dest, "wb") as out:
+                out.write(content)
+            staged.append({"name": safe_name, "status": "uploaded", "path": str(dest)})
+    print(f"[stage] Staged {len(staged)} file(s): {[s['name'] for s in staged]}")
+    return {"files": staged}
+
+
+@app.post("/stage/check")
+async def check_staged(filenames: list[str]):
+    """Check which files already exist in the staging directory."""
+    result: dict[str, bool] = {}
+    for name in filenames:
+        safe_name = name.replace("/", "_").replace("\\", "_")
+        dest = STAGE_DIR / safe_name
+        result[name] = dest.exists()
+    return result
+
+
 @app.post("/export")
 async def start_export(
     timeline: str = Form(...),
@@ -89,8 +120,6 @@ async def start_export(
     job_id = uuid.uuid4().hex[:12]
     job_dir = TEMP_ROOT / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    media_dir = job_dir / "media"
-    media_dir.mkdir(exist_ok=True)
 
     try:
         timeline_data = json.loads(timeline)
@@ -99,16 +128,24 @@ async def start_export(
         raise HTTPException(400, f"Invalid timeline JSON: {e}")
 
     file_map: dict[str, str] = {}
+
+    # First, include any files uploaded with this request (fallback / small files)
     for f in files:
         safe_name = f.filename.replace("/", "_").replace("\\", "_")
-        dest = media_dir / safe_name
-        with open(dest, "wb") as out:
-            content = await f.read()
-            out.write(content)
+        dest = STAGE_DIR / safe_name
+        content = await f.read()
+        if not dest.exists() or dest.stat().st_size != len(content):
+            with open(dest, "wb") as out:
+                out.write(content)
         file_map[f.filename] = str(dest)
         file_map[safe_name] = str(dest)
 
-    print(f"[{job_id}] Received {len(files)} file(s): {list(file_map.keys())}")
+    # Then, add all staged files to the map (so timeline can reference them)
+    for staged_file in STAGE_DIR.iterdir():
+        if staged_file.is_file():
+            file_map[staged_file.name] = str(staged_file)
+
+    print(f"[{job_id}] Available files ({len(file_map)}): {list(set(file_map.values()))}")
     clips_info = [(c.get("sourcePath",""), c.get("sourceName","")) for c in timeline_data.get("clips", []) if c.get("type") != "blank"]
     print(f"[{job_id}] Timeline clips sourcePaths: {clips_info}")
 

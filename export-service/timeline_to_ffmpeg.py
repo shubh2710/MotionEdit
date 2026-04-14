@@ -5,7 +5,9 @@ audio mixing, and hardware-accelerated encoding.
 """
 
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 TRANSITION_MAP = {
@@ -53,6 +55,72 @@ def detect_encoder(ffmpeg_path: str = "ffmpeg") -> str:
 
 def _clip_duration(clip: dict) -> float:
     return (clip["end"] - clip["start"]) / clip.get("speed", 1.0)
+
+
+_FONT_CACHE: dict[str, str] = {}
+
+FONT_NAME_MAP = {
+    "arial": "arial.ttf",
+    "arial bold": "arialbd.ttf",
+    "times new roman": "times.ttf",
+    "times new roman bold": "timesbd.ttf",
+    "courier new": "cour.ttf",
+    "courier new bold": "courbd.ttf",
+    "verdana": "verdana.ttf",
+    "verdana bold": "verdanab.ttf",
+    "georgia": "georgia.ttf",
+    "georgia bold": "georgiab.ttf",
+    "tahoma": "tahoma.ttf",
+    "trebuchet ms": "trebuc.ttf",
+    "impact": "impact.ttf",
+    "comic sans ms": "comic.ttf",
+    "segoe ui": "segoeui.ttf",
+    "segoe ui bold": "segoeuib.ttf",
+    "calibri": "calibri.ttf",
+    "calibri bold": "calibrib.ttf",
+    "consolas": "consola.ttf",
+}
+
+
+def _resolve_font(font_name: str, bold: bool = False) -> str:
+    """Resolve a font family name to an actual .ttf file path on the system."""
+    key = f"{font_name}|{bold}"
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+
+    lookup = f"{font_name} bold".lower() if bold else font_name.lower()
+
+    if sys.platform == "win32":
+        fonts_dir = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+    elif sys.platform == "darwin":
+        fonts_dir = Path("/System/Library/Fonts")
+    else:
+        fonts_dir = Path("/usr/share/fonts/truetype")
+
+    # Try known mapping first
+    mapped = FONT_NAME_MAP.get(lookup) or FONT_NAME_MAP.get(font_name.lower())
+    if mapped:
+        candidate = fonts_dir / mapped
+        if candidate.exists():
+            result = str(candidate).replace("\\", "/").replace(":", "\\:")
+            _FONT_CACHE[key] = result
+            return result
+
+    # Search fonts directory
+    if fonts_dir.exists():
+        search = font_name.lower().replace(" ", "")
+        for f in fonts_dir.rglob("*.ttf"):
+            if search in f.stem.lower():
+                if bold and "bold" not in f.stem.lower() and "bd" not in f.stem.lower():
+                    continue
+                result = str(f).replace("\\", "/").replace(":", "\\:")
+                _FONT_CACHE[key] = result
+                return result
+
+    fallback = fonts_dir / "arial.ttf"
+    result = str(fallback).replace("\\", "/").replace(":", "\\:")
+    _FONT_CACHE[key] = result
+    return result
 
 
 def _has_audio_stream(file_path: str, ffmpeg_path: str = "ffmpeg") -> bool:
@@ -345,12 +413,9 @@ def build_ffmpeg_command(
         stroke_w = style.get("strokeWidth", 0)
         stroke_c = style.get("strokeColor", "#000000")
 
+        fontfile = _resolve_font(font, bold)
         dt = f"drawtext=text='{text}':fontsize={scaled_size}:fontcolor={color}"
-        dt += f":x={x_pos}:y={y_pos}:fontfile=''"
-        if bold:
-            dt += f":font='{font} Bold'"
-        else:
-            dt += f":font='{font}'"
+        dt += f":x={x_pos}:y={y_pos}:fontfile='{fontfile}'"
         if stroke_w > 0:
             dt += f":borderw={stroke_w}:bordercolor={stroke_c}"
 

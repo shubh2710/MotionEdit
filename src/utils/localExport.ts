@@ -54,43 +54,70 @@ export async function exportViaLocalService(
   onProgress(0);
   onStatus({ phase: 'Preparing', detail: 'Collecting media files…', step: 1, totalSteps: 4, elapsedMs: 0 });
 
-  // Build FormData with timeline JSON and all media files
-  const formData = new FormData();
-
-  // Collect unique source paths, upload them, and build a blob-URL -> filename map
-  const uploaded = new Set<string>();
-  const allSources: { path: string; name: string }[] = [];
+  // Collect unique source paths and compute filenames
+  const seen = new Set<string>();
+  const allSources: { path: string; name: string; fileName: string }[] = [];
   const pathToFileName: Record<string, string> = {};
 
   for (const clip of data.clips) {
     if (clip.type === 'blank' || !clip.sourcePath) continue;
-    if (uploaded.has(clip.sourcePath)) continue;
-    uploaded.add(clip.sourcePath);
-    allSources.push({ path: clip.sourcePath, name: clip.sourceName || `clip_${clip.id}` });
+    if (seen.has(clip.sourcePath)) continue;
+    seen.add(clip.sourcePath);
+    const name = clip.sourceName || `clip_${clip.id}`;
+    const ext = guessExtensionFromName(name);
+    const fileName = sanitizeName(name, ext);
+    allSources.push({ path: clip.sourcePath, name, fileName });
+    pathToFileName[clip.sourcePath] = fileName;
   }
 
   for (const io of data.imageOverlays) {
-    if (!io.src || uploaded.has(io.src)) continue;
-    uploaded.add(io.src);
-    allSources.push({ path: io.src, name: io.name || `overlay_${io.id}` });
+    if (!io.src || seen.has(io.src)) continue;
+    seen.add(io.src);
+    const name = io.name || `overlay_${io.id}`;
+    const ext = guessExtensionFromName(name);
+    const fileName = sanitizeName(name, ext);
+    allSources.push({ path: io.src, name, fileName });
+    pathToFileName[io.src] = fileName;
   }
 
-  onStatus({ phase: 'Uploading', detail: `Sending ${allSources.length} file(s) to local service…`, step: 1, totalSteps: 4, elapsedMs: elapsed() });
+  onStatus({ phase: 'Checking files', detail: `Checking ${allSources.length} file(s) on local service…`, step: 1, totalSteps: 4, elapsedMs: elapsed() });
 
-  for (const source of allSources) {
-    try {
-      const response = await fetch(source.path);
-      const blob = await response.blob();
-      const ext = guessExtension(blob.type, source.name);
-      const fileName = sanitizeName(source.name, ext);
-      formData.append('files', blob, fileName);
-      pathToFileName[source.path] = fileName;
-    } catch (err) {
-      console.warn('[LocalExport] Failed to fetch source:', source.path, err);
+  // Check which files are already staged on the server
+  let alreadyStaged: Record<string, boolean> = {};
+  try {
+    const checkRes = await fetch(`${SERVICE_URL}/stage/check`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(allSources.map((s) => s.fileName)),
+    });
+    if (checkRes.ok) alreadyStaged = await checkRes.json();
+  } catch { /* server doesn't support check, upload all */ }
+
+  // Only upload files that aren't already staged
+  const toUpload = allSources.filter((s) => !alreadyStaged[s.fileName]);
+
+  if (toUpload.length > 0) {
+    onStatus({ phase: 'Staging', detail: `Copying ${toUpload.length} new file(s) to local service…`, step: 1, totalSteps: 4, elapsedMs: elapsed() });
+
+    const stageForm = new FormData();
+    for (const source of toUpload) {
+      try {
+        const response = await fetch(source.path);
+        const blob = await response.blob();
+        stageForm.append('files', blob, source.fileName);
+      } catch (err) {
+        console.warn('[LocalExport] Failed to fetch source:', source.path, err);
+      }
     }
+
+    await fetch(`${SERVICE_URL}/stage`, { method: 'POST', body: stageForm });
+  } else {
+    onStatus({ phase: 'Staging', detail: 'All files already on local service', step: 1, totalSteps: 4, elapsedMs: elapsed() });
   }
 
-  // Rewrite timeline so sourcePath/src use the uploaded filenames instead of blob URLs
+  // Build the export request — only timeline JSON, no file uploads needed
+  const formData = new FormData();
+
   const rewrittenClips = data.clips.map((c) => ({
     ...c,
     sourcePath: pathToFileName[c.sourcePath] || c.sourcePath,
@@ -111,7 +138,7 @@ export async function exportViaLocalService(
   formData.append('timeline', JSON.stringify(timeline));
 
   onProgress(5);
-  onStatus({ phase: 'Uploading', detail: 'Sending to FFmpeg service…', step: 2, totalSteps: 4, elapsedMs: elapsed() });
+  onStatus({ phase: 'Starting export', detail: 'Sending timeline to FFmpeg…', step: 2, totalSteps: 4, elapsedMs: elapsed() });
 
   // Start the export job
   let jobId: string;
@@ -233,17 +260,7 @@ function estimateTotalFrames(data: ExportData): number {
   return Math.ceil(maxEnd * data.settings.fps);
 }
 
-function guessExtension(mimeType: string, name: string): string {
-  if (mimeType.includes('mp4') || mimeType.includes('quicktime')) return '.mp4';
-  if (mimeType.includes('webm')) return '.webm';
-  if (mimeType.includes('avi')) return '.avi';
-  if (mimeType.includes('png')) return '.png';
-  if (mimeType.includes('jpeg') || mimeType.includes('jpg')) return '.jpg';
-  if (mimeType.includes('gif')) return '.gif';
-  if (mimeType.includes('webp')) return '.webp';
-  if (mimeType.includes('audio/mpeg')) return '.mp3';
-  if (mimeType.includes('audio/wav')) return '.wav';
-
+function guessExtensionFromName(name: string): string {
   const dotIdx = name.lastIndexOf('.');
   if (dotIdx >= 0) return name.slice(dotIdx);
   return '.mp4';
