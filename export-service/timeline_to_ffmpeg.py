@@ -62,20 +62,6 @@ def build_ffmpeg_command(
     encoder: str = "libx264",
     progress_path: str | None = None,
 ) -> list[str]:
-    """
-    Build a complete FFmpeg command from the editor timeline.
-
-    Args:
-        timeline: The timeline JSON from the browser editor.
-        file_map: Maps original filenames to local file paths.
-        output_path: Where to write the output MP4.
-        ffmpeg_path: Path to the ffmpeg binary.
-        encoder: Video encoder to use (h264_nvenc, h264_qsv, libx264, etc.).
-        progress_path: Path for FFmpeg's -progress output.
-
-    Returns:
-        A list of command-line arguments ready for subprocess.
-    """
     clips = timeline.get("clips", [])
     tracks = timeline.get("tracks", [])
     transitions = timeline.get("transitions", [])
@@ -102,7 +88,7 @@ def build_ffmpeg_command(
     if total_duration <= 0:
         raise ValueError("Timeline is empty")
 
-    # --- Build inputs ---
+    # --- Build inputs (force constant frame rate on each input) ---
     input_args: list[str] = []
     input_index_map: dict[str, int] = {}
     input_counter = 0
@@ -116,7 +102,7 @@ def build_ffmpeg_command(
             source_paths.add(sp)
             local_path = _resolve_path(sp, file_map)
             if local_path:
-                input_args.extend(["-i", local_path])
+                input_args.extend(["-r", str(fps), "-i", local_path])
                 input_index_map[sp] = input_counter
                 input_counter += 1
 
@@ -141,7 +127,12 @@ def build_ffmpeg_command(
         label_counter[0] += 1
         return f"{prefix}{label_counter[0]}"
 
-    # Step 1: Create individual clip streams
+    SCALE_PAD = (
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+    )
+
+    # Step 1: Per-clip stream preparation
     clip_labels: dict[str, str] = {}
 
     for c in video_clips:
@@ -157,31 +148,29 @@ def build_ffmpeg_command(
         lbl = next_label("clip")
 
         if c.get("type") == "image":
+            n_frames = max(1, int(dur * fps))
             filters.append(
-                f"[{idx}:v]loop=loop={int(dur * fps)}:size=1:start=0,"
-                f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-                f"fps={fps},setpts=N/{fps}/TB"
+                f"[{idx}:v]loop=loop={n_frames}:size=1:start=0,"
+                f"{SCALE_PAD},fps={fps},setpts=PTS-STARTPTS"
                 f"[{lbl}]"
             )
         else:
+            raw_dur = dur * speed
             if abs(speed - 1.0) > 0.01:
                 setpts_expr = f"(PTS-STARTPTS)/{speed:.4f}"
             else:
                 setpts_expr = "PTS-STARTPTS"
-            trim_filter = (
-                f"[{idx}:v]trim=start={start:.4f}:duration={dur * speed:.4f},"
+
+            filters.append(
+                f"[{idx}:v]trim=start={start:.4f}:duration={raw_dur:.4f},"
                 f"setpts={setpts_expr},"
-                f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-                f"fps={fps},setpts=N/{fps}/TB"
+                f"{SCALE_PAD},fps={fps}"
                 f"[{lbl}]"
             )
-            filters.append(trim_filter)
 
         clip_labels[clip_id] = lbl
 
-    # Step 2: Build the video timeline with transitions
+    # Step 2: Assemble video timeline with concat / xfade
     if not clip_labels:
         filters.append(f"color=c=black:s={w}x{h}:d={total_duration:.4f}:r={fps}[vbase]")
         current_video = "vbase"
@@ -218,7 +207,6 @@ def build_ffmpeg_command(
                 filters.append(f"[{current_video}][{gap_lbl}]concat=n=2:v=1:a=0[{merged}]")
                 current_video = merged
         else:
-            # Build timeline by concatenating clips with transitions or gaps
             current_video = clip_labels[ordered_clip_ids[0]]
             first_clip = next(c for c in video_clips if c["id"] == ordered_clip_ids[0])
             running_time = _clip_duration(first_clip)
@@ -353,13 +341,14 @@ def build_ffmpeg_command(
         filters.append(f"[{current_video}]{dt}[{merged}]")
         current_video = merged
 
-    # Step 5: Final timestamp normalization for smooth playback
-    final_lbl = next_label("vfinal")
-    filters.append(f"[{current_video}]fps={fps},setpts=N/{fps}/TB[{final_lbl}]")
+    # Step 5: Final — force exact constant frame rate with monotonic timestamps
+    final_lbl = next_label("vout")
+    filters.append(
+        f"[{current_video}]settb=1/{fps},fps={fps},setpts=N/TB[{final_lbl}]"
+    )
     current_video = final_lbl
 
     # Step 6: Audio mix
-    audio_parts: list[str] = []
     audio_labels: list[str] = []
 
     for c in audio_clips:
@@ -416,7 +405,7 @@ def build_ffmpeg_command(
     # --- Assemble command ---
     filter_str = ";\n".join(filters)
 
-    cmd: list[str] = [ffmpeg_path, "-y"]
+    cmd: list[str] = [ffmpeg_path, "-y", "-fflags", "+genpts+igndts"]
 
     if progress_path:
         cmd.extend(["-progress", progress_path, "-nostats"])
@@ -439,7 +428,9 @@ def build_ffmpeg_command(
     else:
         cmd.extend(["-preset", "fast", "-crf", "18"])
 
-    cmd.extend(["-r", str(fps), "-vsync", "cfr", "-pix_fmt", "yuv420p"])
+    cmd.extend(["-r", str(fps), "-fps_mode", "cfr", "-pix_fmt", "yuv420p"])
+    cmd.extend(["-movflags", "+faststart"])
+    cmd.extend(["-video_track_timescale", str(fps * 1000)])
 
     if has_audio and audio_output:
         cmd.extend(["-c:a", "aac", "-b:a", "192k"])
