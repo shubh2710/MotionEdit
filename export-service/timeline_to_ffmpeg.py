@@ -162,7 +162,7 @@ def build_ffmpeg_command(
 
     sorted_clips = sorted(clips, key=lambda c: c.get("offset", 0))
 
-    video_clips = [c for c in sorted_clips if c.get("type") in ("video", "image") and c.get("type") != "blank"]
+    video_clips = [c for c in sorted_clips if c.get("type") in ("video", "image", "blank")]
     audio_clips = [c for c in sorted_clips if c.get("type") in ("video", "audio") and c.get("type") != "blank"]
 
     total_duration = 0
@@ -224,23 +224,38 @@ def build_ffmpeg_command(
     clip_labels: dict[str, str] = {}
 
     for c in video_clips:
+        clip_id = c["id"]
+        clip_type = c.get("type", "video")
+        dur = _clip_duration(c)
+        lbl = next_label("clip")
+
+        if clip_type == "blank":
+            bg_color = c.get("blankBackground", "black")
+            if bg_color.startswith("#"):
+                bg_color = "0x" + bg_color[1:]
+            filters.append(
+                f"color=c={bg_color}:s={w}x{h}:d={dur:.4f}:r={fps}[{lbl}]"
+            )
+            clip_labels[clip_id] = lbl
+            continue
+
         sp = c.get("sourcePath", "") or c.get("sourceName", "")
         idx = input_index_map.get(sp)
         if idx is None:
             continue
 
-        clip_id = c["id"]
         start = c.get("start", 0)
         speed = c.get("speed", 1.0)
-        dur = _clip_duration(c)
-        lbl = next_label("clip")
+        fade_in = c.get("fadeIn", 0)
+        fade_out = c.get("fadeOut", 0)
 
-        if c.get("type") == "image":
+        chain_parts: list[str] = []
+
+        if clip_type == "image":
             n_frames = max(1, int(dur * fps))
-            filters.append(
+            chain_parts.append(
                 f"[{idx}:v]loop=loop={n_frames}:size=1:start=0,"
                 f"{SCALE_PAD},fps={fps},setpts=PTS-STARTPTS"
-                f"[{lbl}]"
             )
         else:
             raw_dur = dur * speed
@@ -249,13 +264,24 @@ def build_ffmpeg_command(
             else:
                 setpts_expr = "PTS-STARTPTS"
 
-            filters.append(
+            chain_parts.append(
                 f"[{idx}:v]trim=start={start:.4f}:duration={raw_dur:.4f},"
                 f"setpts={setpts_expr},"
                 f"{SCALE_PAD},fps={fps}"
-                f"[{lbl}]"
             )
 
+        # Apply fade in/out
+        fades: list[str] = []
+        if fade_in > 0:
+            fades.append(f"fade=t=in:st=0:d={fade_in:.4f}")
+        if fade_out > 0:
+            fade_start = max(0, dur - fade_out)
+            fades.append(f"fade=t=out:st={fade_start:.4f}:d={fade_out:.4f}")
+
+        if fades:
+            chain_parts.append(",".join(fades))
+
+        filters.append(",".join(chain_parts) + f"[{lbl}]")
         clip_labels[clip_id] = lbl
 
     # Step 2: Assemble video timeline with concat / xfade
@@ -491,6 +517,8 @@ def build_ffmpeg_command(
 
     # --- Assemble command ---
     filter_str = ";\n".join(filters)
+    print(f"  [ffmpeg] {len(clip_labels)} video clips, {len(text_overlays)} text overlays, {len(image_overlays)} image overlays, {len(audio_labels)} audio streams")
+    print(f"  [ffmpeg] filter_complex has {len(filters)} filter chains")
 
     cmd: list[str] = [ffmpeg_path, "-y", "-fflags", "+genpts+igndts"]
 

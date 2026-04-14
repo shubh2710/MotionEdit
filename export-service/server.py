@@ -145,9 +145,14 @@ async def start_export(
         if staged_file.is_file():
             file_map[staged_file.name] = str(staged_file)
 
-    print(f"[{job_id}] Available files ({len(file_map)}): {list(set(file_map.values()))}")
-    clips_info = [(c.get("sourcePath",""), c.get("sourceName","")) for c in timeline_data.get("clips", []) if c.get("type") != "blank"]
-    print(f"[{job_id}] Timeline clips sourcePaths: {clips_info}")
+    print(f"[{job_id}] Available files ({len(set(file_map.values()))}): {list(set(file_map.values()))}")
+    for c in timeline_data.get("clips", []):
+        print(f"  clip: type={c.get('type')} src={c.get('sourcePath','')} offset={c.get('offset',0):.2f} fadeIn={c.get('fadeIn',0)} fadeOut={c.get('fadeOut',0)}")
+    for to in timeline_data.get("textOverlays", []):
+        print(f"  text: '{to.get('text','')}' x={to.get('x')} y={to.get('y')} {to.get('startTime',0):.1f}-{to.get('endTime',0):.1f}s")
+    for io in timeline_data.get("imageOverlays", []):
+        print(f"  img overlay: src={io.get('src','')} x={io.get('x')} y={io.get('y')} {io.get('startTime',0):.1f}-{io.get('endTime',0):.1f}s")
+    print(f"  transitions: {len(timeline_data.get('transitions', []))}")
 
     output_path = job_dir / "output.mp4"
     progress_path = job_dir / "progress.log"
