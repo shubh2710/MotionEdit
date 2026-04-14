@@ -56,18 +56,19 @@ def _clip_duration(clip: dict) -> float:
 
 
 def _has_audio_stream(file_path: str, ffmpeg_path: str = "ffmpeg") -> bool:
-    """Check if a media file contains an audio stream."""
-    ffprobe = ffmpeg_path.replace("ffmpeg", "ffprobe")
+    """Check if a media file contains an audio stream using ffmpeg -i."""
     try:
         result = subprocess.run(
-            [ffprobe, "-v", "quiet", "-print_format", "json",
-             "-show_streams", "-select_streams", "a", file_path],
+            [ffmpeg_path, "-i", file_path, "-hide_banner"],
             capture_output=True, text=True, timeout=10,
         )
-        data = json.loads(result.stdout)
-        return len(data.get("streams", [])) > 0
-    except Exception:
-        return True  # assume audio exists if probing fails
+        output = result.stderr or ""
+        has_audio = "Audio:" in output
+        print(f"  [probe] {Path(file_path).name}: audio={'yes' if has_audio else 'no'}")
+        return has_audio
+    except Exception as e:
+        print(f"  [probe] {Path(file_path).name}: probe failed ({e}), assuming no audio")
+        return False
 
 
 def build_ffmpeg_command(

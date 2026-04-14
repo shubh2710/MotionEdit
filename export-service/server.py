@@ -135,6 +135,7 @@ async def start_export(
         "error": None,
     }
 
+    print(f"[{job_id}] Full command:\n{' '.join(cmd)}")
     asyncio.create_task(_run_ffmpeg(job_id, cmd))
 
     return {"job_id": job_id, "status": "started"}
