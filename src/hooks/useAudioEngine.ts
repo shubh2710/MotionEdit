@@ -11,14 +11,9 @@ interface ManagedElement {
 }
 
 /**
- * Manages hidden media elements for clips that produce audio but are NOT the
- * visually-active clip in the main VideoPlayer. This covers:
- * - Audio clips on any track
- * - Video clips placed on audio tracks (extracts their audio)
- * - Video clips on non-active video tracks that overlap the current time
- *
- * The main VideoPlayer handles its own audio, so we skip the single clip
- * it is currently rendering to avoid double-playback.
+ * Manages hidden media elements for ALL clips that produce audio.
+ * The VideoPlayer renders video frames on a canvas with muted pool elements,
+ * so this engine is the sole source of audio for every clip (video & audio).
  */
 export function useAudioEngine() {
   const elementsRef = useRef<Map<string, ManagedElement>>(new Map());
@@ -44,13 +39,10 @@ export function useAudioEngine() {
     const unsub = useEditorStore.subscribe((state, prev) => {
       const { clips, tracks, currentTime, isPlaying } = state;
 
-      const visualClip = findVisualClip(clips, tracks, currentTime);
-
       const activeAudioClips = clips.filter((c) => {
-        if (c.id === visualClip?.id) return false;
         const clipEnd = c.offset + (c.end - c.start) / c.speed;
-        if (currentTime < c.offset || currentTime >= clipEnd) return false;
-        if (c.type === 'image') return false;
+        if (currentTime < c.offset - FRAME_EPS || currentTime >= clipEnd + FRAME_EPS) return false;
+        if (c.type === 'image' || c.type === 'blank') return false;
         return true;
       });
 
@@ -113,14 +105,7 @@ export function useAudioEngine() {
   }, []);
 }
 
-function findVisualClip(clips: Clip[], tracks: { type: string }[], currentTime: number): Clip | undefined {
-  return clips.find((c) => {
-    const clipEnd = c.offset + (c.end - c.start) / c.speed;
-    if (currentTime < c.offset || currentTime >= clipEnd) return false;
-    const track = tracks[c.track];
-    return track?.type === 'video' && (c.type === 'video' || c.type === 'image');
-  });
-}
+const FRAME_EPS = 0.01;
 
 function syncElement(
   el: HTMLVideoElement | HTMLAudioElement,

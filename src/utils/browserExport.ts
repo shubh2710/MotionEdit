@@ -1,7 +1,11 @@
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
-import { Clip, Track, ExportSettings } from './types';
+import { Clip, Track, ExportSettings, TextOverlay, ImageOverlay, Transition } from './types';
 import { computeEffectiveVolume } from './helpers';
 import { muxVideoWithAAC, convertWebMToMP4 } from './ffmpegService';
+import {
+  renderTextOverlay, renderImageOverlay, renderBlankClip,
+  renderTransition, loadImage as loadOverlayImage, preloadOverlayImages,
+} from './overlayRenderer';
 
 export interface ExportCallbacks {
   onProgress: (percent: number) => void;
@@ -9,23 +13,35 @@ export interface ExportCallbacks {
   onError: (error: string) => void;
 }
 
+export interface ExportData {
+  clips: Clip[];
+  tracks: Track[];
+  textOverlays: TextOverlay[];
+  imageOverlays: ImageOverlay[];
+  transitions: Transition[];
+  settings: ExportSettings;
+}
+
 const BITRATE_MAP = { high: 12_000_000, medium: 6_000_000, low: 3_000_000 };
 const AUDIO_BITRATE_MAP = { high: 256_000, medium: 192_000, low: 128_000 };
 const SAMPLE_RATE = 48000;
 const AUDIO_CHANNELS = 2;
 
-// ---------------------------------------------------------------------------
-// Public entry point
-// ---------------------------------------------------------------------------
 export async function browserExportVideo(
-  clips: Clip[],
-  tracks: Track[],
-  settings: ExportSettings,
+  data: ExportData,
   callbacks: ExportCallbacks,
 ): Promise<void> {
-  if (clips.length === 0) {
+  const { clips, settings, textOverlays, imageOverlays } = data;
+
+  const hasContent = clips.length > 0 || textOverlays.length > 0 || imageOverlays.length > 0;
+  if (!hasContent) {
     callbacks.onError('No clips to export');
     return;
+  }
+
+  preloadOverlayImages(imageOverlays);
+  for (const io of imageOverlays) {
+    try { await loadOverlayImage(io.src); } catch {}
   }
 
   const wantMP4 = settings.format !== 'webm';
@@ -34,66 +50,127 @@ export async function browserExportVideo(
   const hasWebCodecs = hasVideoEncoder && hasAudioEncoder;
 
   console.log('[Export] Browser capabilities:', {
-    VideoEncoder: hasVideoEncoder,
-    AudioEncoder: hasAudioEncoder,
-    WebCodecs: hasWebCodecs,
-    format: settings.format,
-    userAgent: navigator.userAgent,
+    VideoEncoder: hasVideoEncoder, AudioEncoder: hasAudioEncoder, WebCodecs: hasWebCodecs,
+    format: settings.format, userAgent: navigator.userAgent,
   });
 
   if (hasWebCodecs && wantMP4) {
-    await exportMP4WebCodecs(clips, tracks, settings, callbacks);
+    await exportMP4WebCodecs(data, callbacks);
   } else if (wantMP4) {
-    await exportMP4ViaWebM(clips, tracks, settings, callbacks);
+    await exportMP4ViaWebM(data, callbacks);
   } else {
-    await exportWebM(clips, tracks, settings, callbacks);
+    await exportWebM(data, callbacks);
   }
 }
 
-// ---------------------------------------------------------------------------
-// PATH A: WebCodecs H.264 video + ffmpeg.wasm AAC audio → MP4
-// Used when browser has WebCodecs (Chrome, Edge, etc.)
-// ---------------------------------------------------------------------------
+function computeTotalDuration(data: ExportData): number {
+  let maxEnd = 0;
+  for (const c of data.clips) maxEnd = Math.max(maxEnd, c.offset + (c.end - c.start) / c.speed);
+  for (const t of data.textOverlays) maxEnd = Math.max(maxEnd, t.endTime);
+  for (const i of data.imageOverlays) maxEnd = Math.max(maxEnd, i.endTime);
+  return maxEnd;
+}
+
+function renderFrame(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  time: number,
+  data: ExportData,
+  videoEls: Map<string, HTMLVideoElement>,
+  imageEls: Map<string, HTMLImageElement>,
+) {
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, w, h);
+
+  const { clips, tracks, transitions, textOverlays, imageOverlays } = data;
+
+  let drewTransition = false;
+  for (const tr of transitions) {
+    const from = clips.find((c) => c.id === tr.fromClipId);
+    const to = clips.find((c) => c.id === tr.toClipId);
+    if (!from || !to) continue;
+
+    const fromEnd = from.offset + (from.end - from.start) / from.speed;
+    const overlapStart = Math.max(fromEnd - tr.duration, to.offset);
+
+    if (time >= overlapStart && time <= fromEnd) {
+      const fromEl = from.type === 'image' ? imageEls.get(from.sourcePath) : videoEls.get(from.sourcePath);
+      const toEl = to.type === 'image' ? imageEls.get(to.sourcePath) : videoEls.get(to.sourcePath);
+      drewTransition = renderTransition(
+        ctx, tr, from, to,
+        (fromEl as HTMLVideoElement | HTMLImageElement) || null,
+        (toEl as HTMLVideoElement | HTMLImageElement) || null,
+        w, h, time,
+      );
+      if (drewTransition) break;
+    }
+  }
+
+  if (!drewTransition) {
+    const vis = findActiveVisualClip(clips, tracks, time);
+    if (vis) {
+      if (vis.type === 'blank') {
+        renderBlankClip(ctx, vis, w, h);
+      } else if (vis.type === 'image') {
+        const img = imageEls.get(vis.sourcePath);
+        if (img) drawFit(ctx, img, w, h);
+      } else if (vis.type === 'video') {
+        const vid = videoEls.get(vis.sourcePath);
+        if (vid) drawFit(ctx, vid, w, h);
+      }
+    }
+  }
+
+  const sortedImages = [...imageOverlays]
+    .filter((o) => time >= o.startTime && time <= o.endTime)
+    .sort((a, b) => a.layer - b.layer);
+  for (const io of sortedImages) {
+    renderImageOverlay(ctx, io, w, h, time);
+  }
+
+  const sortedTexts = [...textOverlays]
+    .filter((o) => time >= o.startTime && time <= o.endTime)
+    .sort((a, b) => a.layer - b.layer);
+  for (const to of sortedTexts) {
+    renderTextOverlay(ctx, to, w, h, time);
+  }
+}
+
+// PATH A: WebCodecs H.264 + ffmpeg.wasm AAC → MP4
 async function exportMP4WebCodecs(
-  clips: Clip[],
-  tracks: Track[],
-  settings: ExportSettings,
+  data: ExportData,
   { onProgress, onComplete, onError }: ExportCallbacks,
 ) {
+  const { clips, tracks, settings } = data;
   const [w, h] = settings.resolution.split('x').map(Number);
   const fps = settings.fps;
   const videoBitrate = BITRATE_MAP[settings.quality];
   const audioBitrate = AUDIO_BITRATE_MAP[settings.quality];
 
   const sortedClips = [...clips].sort((a, b) => a.offset - b.offset);
-  const totalDuration = Math.max(
-    ...sortedClips.map((c) => c.offset + (c.end - c.start) / c.speed),
-  );
+  const totalDuration = computeTotalDuration(data);
 
   if (totalDuration <= 0) { onError('Timeline is empty'); return; }
 
   console.log('[Export] MP4 via WebCodecs + ffmpeg.wasm', {
-    resolution: `${w}x${h}`, fps,
-    duration: totalDuration.toFixed(2) + 's',
-    clips: sortedClips.length,
+    resolution: `${w}x${h}`, fps, duration: totalDuration.toFixed(2) + 's',
+    clips: sortedClips.length, textOverlays: data.textOverlays.length, imageOverlays: data.imageOverlays.length,
   });
 
   onProgress(0);
 
-  // ---- Load source elements ----
   const videoEls = new Map<string, HTMLVideoElement>();
   const imageEls = new Map<string, HTMLImageElement>();
 
   for (const clip of sortedClips) {
+    if (clip.type === 'blank') continue;
     if (clip.type === 'image' && !imageEls.has(clip.sourcePath)) {
       const img = new Image();
       img.src = clip.sourcePath;
-      await loadImage(img);
+      await loadImg(img);
       imageEls.set(clip.sourcePath, img);
-    } else if (
-      (clip.type === 'video' || clip.type === 'audio') &&
-      !videoEls.has(clip.sourcePath)
-    ) {
+    } else if ((clip.type === 'video' || clip.type === 'audio') && !videoEls.has(clip.sourcePath)) {
       const el = document.createElement('video');
       el.preload = 'auto';
       el.muted = true;
@@ -103,33 +180,26 @@ async function exportMP4WebCodecs(
     }
   }
 
-  // ---- Render audio offline ----
   let renderedAudio: AudioBuffer | null = null;
   try {
     renderedAudio = await renderAudioOffline(sortedClips, tracks, totalDuration);
     const rms = computeRMS(renderedAudio);
     console.log('[Export] Offline audio rendered, RMS:', rms.toFixed(6));
-    if (rms < 0.0001) {
-      console.warn('[Export] Audio is silent, discarding');
-      renderedAudio = null;
-    }
+    if (rms < 0.0001) { renderedAudio = null; }
   } catch (err) {
     console.warn('[Export] Offline audio rendering failed:', err);
   }
 
   if (!renderedAudio) {
     try {
-      renderedAudio = await captureAudioRealTime(sortedClips, tracks, totalDuration,
-        (p) => onProgress(Math.round(p * 10)));
+      renderedAudio = await captureAudioRealTime(sortedClips, tracks, totalDuration, (p) => onProgress(Math.round(p * 10)));
       const rms = computeRMS(renderedAudio);
-      console.log('[Export] Real-time audio captured, RMS:', rms.toFixed(6));
       if (rms < 0.0001) { renderedAudio = null; }
     } catch (err) {
       console.warn('[Export] Real-time audio capture failed:', err);
     }
   }
 
-  // ---- Encode H.264 video → video-only MP4 via mp4-muxer ----
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     video: { codec: 'avc', width: w, height: h },
@@ -164,22 +234,14 @@ async function exportMP4WebCodecs(
 
   for (let fi = 0; fi < totalFrames; fi++) {
     const time = fi / fps;
-    ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, w, h);
 
     const vis = findActiveVisualClip(sortedClips, tracks, time);
-    if (vis) {
-      if (vis.type === 'image') {
-        const img = imageEls.get(vis.sourcePath);
-        if (img) drawFit(ctx, img, w, h);
-      } else if (vis.type === 'video') {
-        const vid = videoEls.get(vis.sourcePath);
-        if (vid) {
-          await seekVideo(vid, vis.start + (time - vis.offset) * vis.speed);
-          drawFit(ctx, vid, w, h);
-        }
-      }
+    if (vis && vis.type === 'video') {
+      const vid = videoEls.get(vis.sourcePath);
+      if (vid) await seekVideo(vid, vis.start + (time - vis.offset) * vis.speed);
     }
+
+    renderFrame(ctx, w, h, time, data, videoEls, imageEls);
 
     const frame = new VideoFrame(canvas, { timestamp: Math.round(time * 1_000_000) });
     videoEncoder.encode(frame, { keyFrame: fi % keyFrameInterval === 0 });
@@ -200,31 +262,22 @@ async function exportMP4WebCodecs(
   const videoOnlyBlob = new Blob([videoOnlyBuf], { type: 'video/mp4' });
   console.log('[Export] Video-only MP4:', (videoOnlyBuf.byteLength / 1024 / 1024).toFixed(2), 'MB');
 
-  // ---- Add AAC audio via ffmpeg.wasm ----
   let finalBlob = videoOnlyBlob;
 
   if (renderedAudio) {
     onProgress(75);
     console.log('[Export] Adding AAC audio via ffmpeg.wasm...');
-
     const withAudio = await muxVideoWithAAC(
-      videoOnlyBlob,
-      renderedAudio,
-      audioBitrate,
+      videoOnlyBlob, renderedAudio, audioBitrate,
       (r) => onProgress(75 + Math.round(r * 20)),
     );
-
     if (withAudio) {
       finalBlob = withAudio;
-      console.log('[Export] AAC audio added successfully');
     } else {
       console.warn('[Export] ffmpeg.wasm failed — exporting video-only MP4');
     }
-  } else {
-    console.warn('[Export] No audio available — exporting video-only MP4');
   }
 
-  // Cleanup source elements
   videoEls.forEach((el) => { el.pause(); el.removeAttribute('src'); el.load(); });
 
   onProgress(100);
@@ -233,22 +286,15 @@ async function exportMP4WebCodecs(
   onComplete(finalBlob, filename);
 }
 
-// ---------------------------------------------------------------------------
-// PATH B: No WebCodecs → MediaRecorder WebM → ffmpeg.wasm converts to MP4
-// ---------------------------------------------------------------------------
+// PATH B: MediaRecorder WebM → ffmpeg.wasm MP4
 async function exportMP4ViaWebM(
-  clips: Clip[],
-  tracks: Track[],
-  settings: ExportSettings,
+  data: ExportData,
   { onProgress, onComplete, onError }: ExportCallbacks,
 ) {
   console.log('[Export] MP4 via WebM capture + ffmpeg.wasm conversion');
-  const audioBitrate = AUDIO_BITRATE_MAP[settings.quality];
+  const audioBitrate = AUDIO_BITRATE_MAP[data.settings.quality];
 
-  const webmBlob = await captureWebM(clips, tracks, settings, (p) => {
-    onProgress(Math.round(p * 50));
-  });
-
+  const webmBlob = await captureWebM(data, (p) => onProgress(Math.round(p * 50)));
   if (!webmBlob) { onError('WebM capture failed'); return; }
 
   console.log('[Export] WebM captured:', (webmBlob.size / 1024 / 1024).toFixed(2), 'MB');
@@ -263,54 +309,35 @@ async function exportMP4ViaWebM(
     onProgress(100);
     onComplete(mp4Blob, `export_${Date.now()}.mp4`);
   } else {
-    console.warn('[Export] ffmpeg conversion failed, delivering WebM instead');
     onProgress(100);
     onComplete(webmBlob, `export_${Date.now()}.webm`);
   }
 }
 
-// ---------------------------------------------------------------------------
-// PATH C: Direct WebM export via MediaRecorder
-// ---------------------------------------------------------------------------
+// PATH C: Direct WebM
 async function exportWebM(
-  clips: Clip[],
-  tracks: Track[],
-  settings: ExportSettings,
+  data: ExportData,
   { onProgress, onComplete, onError }: ExportCallbacks,
 ) {
-  const webmBlob = await captureWebM(clips, tracks, settings, (p) => {
-    onProgress(Math.round(p * 100));
-  });
-
+  const webmBlob = await captureWebM(data, (p) => onProgress(Math.round(p * 100)));
   if (!webmBlob) { onError('Export failed'); return; }
-
   onProgress(100);
   onComplete(webmBlob, `export_${Date.now()}.webm`);
 }
 
-// ---------------------------------------------------------------------------
-// Shared: Capture timeline to WebM using MediaRecorder
-// ---------------------------------------------------------------------------
+// Shared: Capture timeline to WebM
 async function captureWebM(
-  clips: Clip[],
-  tracks: Track[],
-  settings: ExportSettings,
+  data: ExportData,
   onProgress: (fraction: number) => void,
 ): Promise<Blob | null> {
+  const { clips, tracks, settings } = data;
   const [w, h] = settings.resolution.split('x').map(Number);
   const fps = settings.fps;
   const videoBitrate = BITRATE_MAP[settings.quality];
   const sortedClips = [...clips].sort((a, b) => a.offset - b.offset);
-  const totalDuration = Math.max(
-    ...sortedClips.map((c) => c.offset + (c.end - c.start) / c.speed),
-  );
+  const totalDuration = computeTotalDuration(data);
 
-  console.log('[WebM] Starting capture', { w, h, fps, duration: totalDuration.toFixed(2), clips: sortedClips.length });
-
-  if (totalDuration <= 0) {
-    console.error('[WebM] totalDuration is 0, nothing to capture');
-    return null;
-  }
+  if (totalDuration <= 0) return null;
 
   const canvas = document.createElement('canvas');
   canvas.width = w;
@@ -323,7 +350,6 @@ async function captureWebM(
     audioCtx = new AudioContext();
     await audioCtx.resume();
     audioDestination = audioCtx.createMediaStreamDestination();
-    console.log('[WebM] AudioContext created, state:', audioCtx.state);
   } catch (err) {
     console.error('[WebM] AudioContext creation failed:', err);
     return null;
@@ -337,23 +363,30 @@ async function captureWebM(
 
   const states: ClipState[] = [];
 
+  const videoEls = new Map<string, HTMLVideoElement>();
+  const imageEls = new Map<string, HTMLImageElement>();
+
   for (const clip of sortedClips) {
-    if (clip.type === 'image') {
-      const img = new Image();
-      img.src = clip.sourcePath;
-      await loadImage(img);
-      states.push({ clip, element: img, gainNode: null });
-      console.log('[WebM] Loaded image:', clip.sourceName);
+    if (clip.type === 'blank') {
+      states.push({ clip, element: new Image(), gainNode: null });
       continue;
     }
 
-    const el = clip.type === 'audio'
-      ? document.createElement('audio')
-      : document.createElement('video');
+    if (clip.type === 'image') {
+      const img = new Image();
+      img.src = clip.sourcePath;
+      await loadImg(img);
+      imageEls.set(clip.sourcePath, img);
+      states.push({ clip, element: img, gainNode: null });
+      continue;
+    }
+
+    const el = clip.type === 'audio' ? document.createElement('audio') : document.createElement('video');
     el.preload = 'auto';
     el.src = clip.sourcePath;
     await loadMediaElement(el);
-    console.log('[WebM] Loaded media:', clip.sourceName, 'readyState:', el.readyState);
+
+    if (el instanceof HTMLVideoElement) videoEls.set(clip.sourcePath, el);
 
     let gainNode: GainNode | null = null;
     try {
@@ -362,25 +395,15 @@ async function captureWebM(
       gainNode.gain.value = 0;
       srcNode.connect(gainNode);
       gainNode.connect(audioDestination);
-    } catch (err) {
-      console.warn('[WebM] Audio connect failed for', clip.sourceName, ':', err);
-    }
+    } catch {}
 
     states.push({ clip, element: el, gainNode });
-  }
-
-  if (states.length === 0) {
-    console.error('[WebM] No clips could be loaded');
-    audioCtx.close().catch(() => {});
-    return null;
   }
 
   let canvasStream: MediaStream;
   try {
     canvasStream = canvas.captureStream(fps);
-    console.log('[WebM] Canvas stream tracks:', canvasStream.getVideoTracks().length);
-  } catch (err) {
-    console.error('[WebM] canvas.captureStream() failed:', err);
+  } catch {
     audioCtx.close().catch(() => {});
     return null;
   }
@@ -389,41 +412,21 @@ async function captureWebM(
     ...canvasStream.getVideoTracks(),
     ...audioDestination.stream.getAudioTracks(),
   ]);
-  console.log('[WebM] Combined stream — video tracks:', combinedStream.getVideoTracks().length,
-    'audio tracks:', combinedStream.getAudioTracks().length);
 
-  const mimeTypes = [
-    'video/webm;codecs=vp9,opus',
-    'video/webm;codecs=vp8,opus',
-    'video/webm',
-  ];
+  const mimeTypes = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
   const mimeType = mimeTypes.find((m) => MediaRecorder.isTypeSupported(m));
-
-  if (!mimeType) {
-    console.error('[WebM] No supported MediaRecorder mime type found!');
-    console.log('[WebM] Tested:', mimeTypes.map(m => `${m}: ${MediaRecorder.isTypeSupported(m)}`));
-    audioCtx.close().catch(() => {});
-    return null;
-  }
-
-  console.log('[WebM] Using mime type:', mimeType);
+  if (!mimeType) { audioCtx.close().catch(() => {}); return null; }
 
   let recorder: MediaRecorder;
   try {
-    recorder = new MediaRecorder(combinedStream, {
-      mimeType,
-      videoBitsPerSecond: videoBitrate,
-    });
-  } catch (err) {
-    console.error('[WebM] MediaRecorder creation failed:', err);
+    recorder = new MediaRecorder(combinedStream, { mimeType, videoBitsPerSecond: videoBitrate });
+  } catch {
     audioCtx.close().catch(() => {});
     return null;
   }
 
   const chunks: Blob[] = [];
-  recorder.ondataavailable = (e) => {
-    if (e.data.size > 0) chunks.push(e.data);
-  };
+  recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
 
   return new Promise<Blob | null>((resolve) => {
     recorder.onstop = () => {
@@ -436,24 +439,13 @@ async function captureWebM(
       }
       audioCtx.close().catch(() => {});
 
-      console.log('[WebM] Recording stopped, chunks:', chunks.length);
-      if (chunks.length === 0) {
-        console.error('[WebM] No data chunks recorded!');
-        resolve(null);
-        return;
-      }
-      const blob = new Blob(chunks, { type: mimeType });
-      console.log('[WebM] Final blob:', (blob.size / 1024 / 1024).toFixed(2), 'MB');
-      resolve(blob);
+      if (chunks.length === 0) { resolve(null); return; }
+      resolve(new Blob(chunks, { type: mimeType }));
     };
 
-    recorder.onerror = (e) => {
-      console.error('[WebM] MediaRecorder error:', e);
-      resolve(null);
-    };
-
+    recorder.onerror = () => resolve(null);
     recorder.start(100);
-    console.log('[WebM] Recording started');
+
     const startWall = performance.now();
 
     function render() {
@@ -467,11 +459,11 @@ async function captureWebM(
 
       onProgress(Math.min(0.99, elapsed / totalDuration));
 
-      ctx.fillStyle = '#000000';
-      ctx.fillRect(0, 0, w, h);
+      renderFrame(ctx, w, h, elapsed, data, videoEls, imageEls);
 
-      let drewVisual = false;
       for (const { clip, element, gainNode } of states) {
+        if (clip.type === 'blank' || clip.type === 'image') continue;
+
         const clipDur = (clip.end - clip.start) / clip.speed;
         const clipEnd = clip.offset + clipDur;
         const isActive = elapsed >= clip.offset && elapsed < clipEnd;
@@ -486,22 +478,14 @@ async function captureWebM(
         const vol = computeEffectiveVolume(clip, elapsed, track?.muted ?? false);
         if (gainNode) gainNode.gain.value = Math.min(1, Math.max(0, vol));
 
-        if (element instanceof HTMLImageElement) {
-          if (!drewVisual) { drawFit(ctx, element, w, h); drewVisual = true; }
-        } else if (element instanceof HTMLMediaElement) {
+        if (element instanceof HTMLMediaElement) {
           const srcTime = clip.start + (elapsed - clip.offset) * clip.speed;
           element.playbackRate = clip.speed;
-
           if (element.paused) {
             element.currentTime = srcTime;
             element.play().catch(() => {});
           } else if (Math.abs(element.currentTime - srcTime) > 0.3) {
             element.currentTime = srcTime;
-          }
-
-          if (element instanceof HTMLVideoElement && clip.type === 'video' && !drewVisual) {
-            drawFit(ctx, element, w, h);
-            drewVisual = true;
           }
         }
       }
@@ -513,24 +497,15 @@ async function captureWebM(
   });
 }
 
-// ---------------------------------------------------------------------------
 // Offline audio rendering
-// ---------------------------------------------------------------------------
-async function renderAudioOffline(
-  clips: Clip[],
-  tracks: Track[],
-  duration: number,
-): Promise<AudioBuffer> {
+async function renderAudioOffline(clips: Clip[], tracks: Track[], duration: number): Promise<AudioBuffer> {
   const totalSamples = Math.ceil(duration * SAMPLE_RATE);
   const offlineCtx = new OfflineAudioContext(AUDIO_CHANNELS, totalSamples, SAMPLE_RATE);
-
   const decodeCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
   await decodeCtx.resume();
 
-  const audioClips = clips.filter((c) => c.type !== 'image');
+  const audioClips = clips.filter((c) => c.type !== 'image' && c.type !== 'blank');
   let decodedCount = 0;
-
-  console.log('[Audio:Offline] Processing', audioClips.length, 'audio-bearing clips');
 
   for (const clip of audioClips) {
     const track = tracks[clip.track];
@@ -541,11 +516,7 @@ async function renderAudioOffline(
       const resp = await fetch(clip.sourcePath);
       const arrBuf = await resp.arrayBuffer();
       audioBuffer = await decodeCtx.decodeAudioData(arrBuf);
-      console.log('[Audio:Offline] Decoded', clip.sourceName, audioBuffer.duration.toFixed(2) + 's');
-    } catch (err) {
-      console.warn('[Audio:Offline] Failed to decode', clip.sourceName, ':', err);
-      continue;
-    }
+    } catch { continue; }
 
     decodedCount++;
 
@@ -560,9 +531,7 @@ async function renderAudioOffline(
     const baseVol = clip.audioVolume;
 
     gainNode.gain.setValueAtTime(clip.fadeIn > 0 ? 0 : baseVol, startTime);
-    if (clip.fadeIn > 0) {
-      gainNode.gain.linearRampToValueAtTime(baseVol, startTime + clip.fadeIn);
-    }
+    if (clip.fadeIn > 0) gainNode.gain.linearRampToValueAtTime(baseVol, startTime + clip.fadeIn);
     if (clip.fadeOut > 0) {
       const fadeOutStart = endTime - clip.fadeOut;
       if (clip.fadeIn <= 0 || fadeOutStart > startTime + clip.fadeIn) {
@@ -577,18 +546,14 @@ async function renderAudioOffline(
   }
 
   await decodeCtx.close();
-  if (decodedCount === 0) throw new Error('No audio decoded from any clip');
+  if (decodedCount === 0) throw new Error('No audio decoded');
 
   return await offlineCtx.startRendering();
 }
 
-// ---------------------------------------------------------------------------
 // Real-time audio capture fallback
-// ---------------------------------------------------------------------------
 async function captureAudioRealTime(
-  clips: Clip[],
-  tracks: Track[],
-  duration: number,
+  clips: Clip[], tracks: Track[], duration: number,
   onProgress?: (fraction: number) => void,
 ): Promise<AudioBuffer> {
   const audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
@@ -599,7 +564,7 @@ async function captureAudioRealTime(
   const states: CaptureState[] = [];
 
   for (const clip of clips) {
-    if (clip.type === 'image') continue;
+    if (clip.type === 'image' || clip.type === 'blank') continue;
     const el = clip.type === 'audio' ? document.createElement('audio') : document.createElement('video');
     el.preload = 'auto';
     el.src = clip.sourcePath;
@@ -615,13 +580,9 @@ async function captureAudioRealTime(
     } catch { continue; }
   }
 
-  if (states.length === 0) {
-    await audioCtx.close();
-    throw new Error('No audio elements could be connected');
-  }
+  if (states.length === 0) { await audioCtx.close(); throw new Error('No audio elements'); }
 
-  const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-    ? 'audio/webm;codecs=opus' : 'audio/webm';
+  const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
   const recorder = new MediaRecorder(dest.stream, { mimeType });
   const chunks: Blob[] = [];
   recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
@@ -671,9 +632,7 @@ async function captureAudioRealTime(
   });
 }
 
-// ---------------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
 
 export function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -696,9 +655,13 @@ function computeRMS(buffer: AudioBuffer): number {
   return total > 0 ? Math.sqrt(sum / total) : 0;
 }
 
+const FRAME_EPS = 0.01;
+
 function findActiveVisualClip(clips: Clip[], tracks: Track[], time: number): Clip | undefined {
   return clips.find((c) => {
-    if (time < c.offset || time >= c.offset + (c.end - c.start) / c.speed) return false;
+    const clipEnd = c.offset + (c.end - c.start) / c.speed;
+    if (time < c.offset - FRAME_EPS || time >= clipEnd + FRAME_EPS) return false;
+    if (c.type === 'blank') return true;
     const track = tracks[c.track];
     return track?.type === 'video' && (c.type === 'video' || c.type === 'image');
   });
@@ -723,7 +686,7 @@ function seekVideo(video: HTMLVideoElement, time: number): Promise<void> {
   });
 }
 
-function loadImage(img: HTMLImageElement): Promise<void> {
+function loadImg(img: HTMLImageElement): Promise<void> {
   return new Promise((resolve) => {
     if (img.complete && img.naturalWidth > 0) { resolve(); return; }
     img.onload = () => resolve();

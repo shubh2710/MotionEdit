@@ -3,12 +3,20 @@ import { useEditorStore } from '../../store/editorStore';
 import { secondsToPixels, pixelsToSeconds, formatTime } from '../../utils/helpers';
 import { processFiles, loadMediaMetadata } from '../../utils/mediaImport';
 import { TimelineClip } from './TimelineClip';
+import { TimelineOverlayItem } from './TimelineOverlayItem';
+import { AddTransitionButton } from './AddTransitionButton';
 import { TimelineRuler } from './TimelineRuler';
+import { Clip } from '../../utils/types';
+
+function clipDuration(c: Clip): number {
+  return (c.end - c.start) / c.speed;
+}
 
 export const Timeline: React.FC = () => {
   const {
     clips, tracks, zoom, currentTime, duration,
     setCurrentTime, clearSelection, addClipToTimeline, mediaFiles, addMediaFiles,
+    textOverlays, imageOverlays, transitions,
   } = useEditorStore();
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -19,7 +27,6 @@ export const Timeline: React.FC = () => {
 
   const handleTimelineClick = useCallback((e: React.MouseEvent) => {
     if ((e.target as HTMLElement).closest('[data-timeline-clip]')) return;
-
     const container = scrollContainerRef.current;
     if (!container) return;
     const rect = container.getBoundingClientRect();
@@ -32,7 +39,6 @@ export const Timeline: React.FC = () => {
   const handlePlayheadDrag = useCallback((e: React.MouseEvent) => {
     e.stopPropagation();
     setIsDraggingPlayhead(true);
-
     const container = scrollContainerRef.current;
     if (!container) return;
 
@@ -55,7 +61,6 @@ export const Timeline: React.FC = () => {
   const getDropPosition = useCallback((e: React.DragEvent) => {
     const container = scrollContainerRef.current;
     if (!container) return { offset: 0, trackIndex: 0 };
-
     const rect = container.getBoundingClientRect();
     const x = e.clientX - rect.left + container.scrollLeft;
     const y = e.clientY - rect.top;
@@ -125,7 +130,6 @@ export const Timeline: React.FC = () => {
   useEffect(() => {
     const container = scrollContainerRef.current;
     if (!container || isDraggingPlayhead) return;
-
     const containerWidth = container.clientWidth;
     const scrollLeft = container.scrollLeft;
     if (playheadPos < scrollLeft || playheadPos > scrollLeft + containerWidth - 100) {
@@ -153,7 +157,6 @@ export const Timeline: React.FC = () => {
       </div>
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Track labels */}
         <div className="w-32 flex-shrink-0 border-r border-gray-800 bg-gray-900/50">
           <div className="h-[30px] border-b border-gray-800" />
           {tracks.map((track) => (
@@ -161,7 +164,6 @@ export const Timeline: React.FC = () => {
           ))}
         </div>
 
-        {/* Scrollable timeline area */}
         <div
           ref={scrollContainerRef}
           className="flex-1 overflow-auto relative"
@@ -170,35 +172,70 @@ export const Timeline: React.FC = () => {
           onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
         >
           <div style={{ width: totalWidth, minHeight: '100%' }} className="relative">
-            {/* Ruler */}
             <div className="sticky top-0 z-20" onClick={handleTimelineClick}>
               <TimelineRuler width={totalWidth} zoom={zoom} />
             </div>
 
-            {/* Track rows */}
-            {tracks.map((track, index) => (
-              <div
-                key={track.id}
-                className={`h-[60px] border-b border-gray-800/50 relative
-                  ${index % 2 === 0 ? 'bg-gray-900/30' : 'bg-gray-900/10'}`}
-                onClick={handleTimelineClick}
-              >
-                {clips
-                  .filter((c) => c.track === index)
-                  .map((clip) => (
+            {tracks.map((track, index) => {
+              const isOverlay = track.type === 'overlay';
+              const trackClips = clips
+                .filter((c) => c.track === index)
+                .sort((a, b) => a.offset - b.offset);
+
+              // Build adjacent pairs for transition buttons
+              const adjacentPairs: { from: Clip; to: Clip }[] = [];
+              if (!isOverlay) {
+                for (let i = 0; i < trackClips.length - 1; i++) {
+                  adjacentPairs.push({ from: trackClips[i], to: trackClips[i + 1] });
+                }
+              }
+
+              return (
+                <div
+                  key={track.id}
+                  className={`h-[60px] border-b border-gray-800/50 relative group
+                    ${isOverlay ? 'bg-amber-900/5' : index % 2 === 0 ? 'bg-gray-900/30' : 'bg-gray-900/10'}`}
+                  onClick={handleTimelineClick}
+                >
+                  {!isOverlay && trackClips.map((clip) => (
                     <TimelineClip key={clip.id} clip={clip} zoom={zoom} />
                   ))}
-              </div>
-            ))}
 
-            {/* Empty space for tracks with no content */}
+                  {!isOverlay && adjacentPairs.map(({ from, to }) => {
+                    const existing = transitions.find(
+                      (t) => t.fromClipId === from.id && t.toClipId === to.id,
+                    );
+                    return (
+                      <AddTransitionButton
+                        key={`tr-${from.id}-${to.id}`}
+                        fromClip={from}
+                        toClip={to}
+                        existingTransition={existing}
+                        zoom={zoom}
+                      />
+                    );
+                  })}
+
+                  {isOverlay && (
+                    <>
+                      {textOverlays.map((to) => (
+                        <TimelineOverlayItem key={to.id} overlay={to} type="text" zoom={zoom} />
+                      ))}
+                      {imageOverlays.map((io) => (
+                        <TimelineOverlayItem key={io.id} overlay={io} type="image" zoom={zoom} />
+                      ))}
+                    </>
+                  )}
+                </div>
+              );
+            })}
+
             {tracks.length === 0 && (
               <div className="h-[180px] flex items-center justify-center text-gray-600 text-sm">
                 Add tracks and drag media here
               </div>
             )}
 
-            {/* Playhead */}
             <div
               className="absolute top-0 bottom-0 z-30 pointer-events-none"
               style={{ left: playheadPos }}
@@ -219,12 +256,13 @@ export const Timeline: React.FC = () => {
 
 const TrackLabel: React.FC<{ track: { id: string; name: string; type: string; muted: boolean; locked: boolean } }> = ({ track }) => {
   const { toggleTrackMute, toggleTrackLock } = useEditorStore();
+  const dotColor = track.type === 'video' ? 'bg-blue-500' : track.type === 'audio' ? 'bg-green-500' : 'bg-amber-500';
 
   return (
     <div className="h-[60px] border-b border-gray-800/50 flex items-center px-2 gap-1">
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-1.5">
-          <div className={`w-2 h-2 rounded-full ${track.type === 'video' ? 'bg-blue-500' : 'bg-green-500'}`} />
+          <div className={`w-2 h-2 rounded-full ${dotColor}`} />
           <span className="text-[11px] font-medium text-gray-300 truncate">{track.name}</span>
         </div>
       </div>

@@ -8,13 +8,14 @@ interface ExportModalProps {
 }
 
 export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
-  const { clips, tracks, exportSettings, setExportSettings, isExporting, exportProgress } = useEditorStore();
+  const { clips, tracks, textOverlays, imageOverlays, transitions, exportSettings, setExportSettings, isExporting, exportProgress } = useEditorStore();
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
   const isBrowser = !window.electronAPI;
   const hasWebCodecs = typeof VideoEncoder !== 'undefined' && typeof AudioEncoder !== 'undefined';
-  const canExport = clips.length > 0 && !isExporting;
+  const hasContent = clips.length > 0 || textOverlays.length > 0 || imageOverlays.length > 0;
+  const canExport = hasContent && !isExporting;
 
   const handleExport = async () => {
     if (!canExport) return;
@@ -51,7 +52,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
       setStatusMessage(mode);
 
       try {
-        await browserExportVideo(clips, tracks, exportSettings, {
+        await browserExportVideo({
+          clips, tracks, textOverlays, imageOverlays, transitions,
+          settings: exportSettings,
+        }, {
           onProgress: (percent) => {
             useEditorStore.getState().setExportProgress(percent);
             if (percent > 0 && percent < 100) {
