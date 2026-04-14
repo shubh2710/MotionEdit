@@ -162,15 +162,81 @@ async def _run_ffmpeg(job_id: str, cmd: list[str]):
             elapsed = time.time() - job["start_time"]
             print(f"[{job_id}] Done: {size_mb:.1f} MB in {elapsed:.1f}s")
         else:
-            job["status"] = "error"
             err_text = stderr.decode(errors="replace")[-500:] if stderr else "Unknown error"
-            job["error"] = err_text
             print(f"[{job_id}] FFmpeg failed (code {proc.returncode}): {err_text[:200]}")
+
+            # Retry with libx264 if hardware encoder failed
+            current_encoder = None
+            for i, arg in enumerate(cmd):
+                if arg == "-c:v" and i + 1 < len(cmd):
+                    current_encoder = cmd[i + 1]
+                    break
+
+            if current_encoder and current_encoder != "libx264":
+                print(f"[{job_id}] Retrying with libx264 fallback...")
+                fallback_cmd = _build_fallback_cmd(cmd, current_encoder)
+                job["status"] = "running"
+                job["start_time"] = time.time()
+
+                proc2 = await asyncio.create_subprocess_exec(
+                    *fallback_cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                job["pid"] = proc2.pid
+                _, stderr2 = await proc2.communicate()
+
+                if proc2.returncode == 0 and os.path.exists(job["output"]):
+                    job["status"] = "done"
+                    size_mb = os.path.getsize(job["output"]) / 1024 / 1024
+                    elapsed = time.time() - job["start_time"]
+                    print(f"[{job_id}] Done (libx264 fallback): {size_mb:.1f} MB in {elapsed:.1f}s")
+                else:
+                    job["status"] = "error"
+                    err2 = stderr2.decode(errors="replace")[-500:] if stderr2 else err_text
+                    job["error"] = err2
+                    print(f"[{job_id}] Fallback also failed: {err2[:200]}")
+            else:
+                job["status"] = "error"
+                job["error"] = err_text
 
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)
         print(f"[{job_id}] Exception: {e}")
+
+
+def _build_fallback_cmd(cmd: list[str], hw_encoder: str) -> list[str]:
+    """Replace a hardware encoder with libx264 and adjust flags."""
+    fallback = list(cmd)
+    hw_flags = {
+        "h264_nvenc": ["-preset", "-rc", "-cq", "-b:v", "-maxrate"],
+        "h264_qsv": ["-preset", "-global_quality"],
+        "h264_amf": ["-quality", "-rc", "-qp_i", "-qp_p", "-b:v"],
+    }
+    flags_to_remove = hw_flags.get(hw_encoder, [])
+
+    i = 0
+    while i < len(fallback):
+        if fallback[i] == "-c:v" and i + 1 < len(fallback) and fallback[i + 1] == hw_encoder:
+            fallback[i + 1] = "libx264"
+            i += 2
+        elif fallback[i] in flags_to_remove and i + 1 < len(fallback):
+            fallback.pop(i)
+            fallback.pop(i)
+        else:
+            i += 1
+
+    # Insert libx264 defaults after -c:v libx264
+    for i, arg in enumerate(fallback):
+        if arg == "-c:v" and i + 1 < len(fallback) and fallback[i + 1] == "libx264":
+            fallback.insert(i + 2, "-preset")
+            fallback.insert(i + 3, "fast")
+            fallback.insert(i + 4, "-crf")
+            fallback.insert(i + 5, "18")
+            break
+
+    return fallback
 
 
 PROGRESS_RE = re.compile(

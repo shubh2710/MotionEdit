@@ -420,14 +420,14 @@ def build_ffmpeg_command(
 
     # Video encoding
     cmd.extend(["-c:v", encoder])
-    if encoder == "libx264":
-        cmd.extend(["-preset", "fast", "-crf", "18", "-b:v", bitrate])
-    elif encoder == "h264_nvenc":
-        cmd.extend(["-preset", "p4", "-cq", "20", "-b:v", bitrate])
+    if encoder == "h264_nvenc":
+        cmd.extend(["-preset", "fast", "-rc", "vbr", "-cq", "20", "-b:v", bitrate, "-maxrate", bitrate])
     elif encoder == "h264_qsv":
-        cmd.extend(["-preset", "fast", "-global_quality", "20", "-b:v", bitrate])
+        cmd.extend(["-preset", "fast", "-global_quality", "20"])
     elif encoder == "h264_amf":
-        cmd.extend(["-quality", "speed", "-rc", "cqp", "-qp_i", "20", "-qp_p", "20", "-b:v", bitrate])
+        cmd.extend(["-quality", "speed", "-rc", "vbr_latency", "-qp_i", "20", "-qp_p", "20", "-b:v", bitrate])
+    else:
+        cmd.extend(["-preset", "fast", "-crf", "18"])
 
     cmd.extend(["-r", str(fps), "-s", f"{w}x{h}", "-pix_fmt", "yuv420p"])
 
