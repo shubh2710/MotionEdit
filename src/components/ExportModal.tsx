@@ -3,10 +3,13 @@ import { useEditorStore } from '../store/editorStore';
 import { ExportSettings } from '../utils/types';
 import { browserExportVideo, downloadBlob, ExportStatus } from '../utils/browserExport';
 import { getExportLockState, WakeLockState } from '../utils/exportWakeLock';
+import { checkLocalService, exportViaLocalService, LocalServiceInfo } from '../utils/localExport';
 
 interface ExportModalProps {
   onClose: () => void;
 }
+
+type ExportMode = 'browser' | 'local';
 
 export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
   const { clips, tracks, textOverlays, imageOverlays, transitions, exportSettings, setExportSettings, isExporting, exportProgress } = useEditorStore();
@@ -14,6 +17,22 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
   const [exportError, setExportError] = useState<string | null>(null);
   const [exportStatus, setExportStatus] = useState<ExportStatus | null>(null);
   const [lockState, setLockState] = useState<WakeLockState | null>(null);
+
+  const [exportMode, setExportMode] = useState<ExportMode>('browser');
+  const [localInfo, setLocalInfo] = useState<LocalServiceInfo | null>(null);
+  const [checkingLocal, setCheckingLocal] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setCheckingLocal(true);
+    checkLocalService().then((info) => {
+      if (cancelled) return;
+      setLocalInfo(info);
+      if (info.available) setExportMode('local');
+      setCheckingLocal(false);
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (!isExporting) { setLockState(null); return; }
@@ -48,6 +67,40 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
       } catch (err) {
         setExportError(`Export failed: ${err}`);
       } finally {
+        useEditorStore.getState().setIsExporting(false);
+      }
+    } else if (exportMode === 'local' && localInfo?.available) {
+      useEditorStore.getState().setIsExporting(true);
+      useEditorStore.getState().setExportProgress(0);
+      setStatusMessage('Sending to local FFmpeg service…');
+
+      try {
+        await exportViaLocalService({
+          clips, tracks, textOverlays, imageOverlays, transitions,
+          settings: exportSettings,
+        }, {
+          onProgress: (percent) => {
+            useEditorStore.getState().setExportProgress(percent);
+          },
+          onStatus: (status) => {
+            setExportStatus(status);
+            setStatusMessage(status.detail);
+          },
+          onComplete: (blob, filename) => {
+            downloadBlob(blob, filename);
+            setStatusMessage(`Export complete! "${filename}" (${formatBlobSize(blob.size)})`);
+            setExportStatus((prev) => prev ? { ...prev, phase: 'Complete' } : null);
+            useEditorStore.getState().setIsExporting(false);
+            useEditorStore.getState().setExportProgress(100);
+          },
+          onError: (error) => {
+            setExportError(error);
+            setExportStatus(null);
+            useEditorStore.getState().setIsExporting(false);
+          },
+        });
+      } catch (err) {
+        setExportError(`Export failed: ${err}`);
         useEditorStore.getState().setIsExporting(false);
       }
     } else {
@@ -96,7 +149,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={isExporting ? undefined : onClose}>
       <div
-        className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-[440px] max-h-[80vh] overflow-y-auto"
+        className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-[480px] max-h-[85vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-800">
@@ -109,16 +162,92 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
         </div>
 
         <div className="p-5 space-y-5">
-          {/* Browser mode notice */}
-          {isBrowser && hasWebCodecs && (
-            <div className="bg-green-900/20 border border-green-800/40 rounded-lg px-3 py-2 text-xs text-green-300">
-              <p className="font-medium mb-0.5">High-Quality Export (H.264 + AAC)</p>
-              <p className="text-green-400/80">
-                Hardware-accelerated video encoding with AAC audio. YouTube, Instagram, and all players compatible.
+          {/* Export Mode Toggle */}
+          {isBrowser && !isExporting && (
+            <div>
+              <label className="block text-sm font-medium text-gray-300 mb-2">Export Engine</label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => setExportMode('local')}
+                  disabled={!localInfo?.available}
+                  className={`relative py-2.5 px-3 rounded-lg text-sm font-medium transition-colors text-left
+                    ${exportMode === 'local' && localInfo?.available
+                      ? 'bg-emerald-700/50 border border-emerald-500/60 text-emerald-200'
+                      : localInfo?.available
+                        ? 'bg-gray-800 text-gray-400 hover:bg-gray-700 border border-gray-700'
+                        : 'bg-gray-800/50 text-gray-600 border border-gray-800 cursor-not-allowed'}`}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                    </svg>
+                    Local FFmpeg
+                  </div>
+                  <div className="text-[10px] mt-0.5 opacity-70">
+                    {checkingLocal
+                      ? 'Checking…'
+                      : localInfo?.available
+                        ? `${localInfo.encoder} · 10-50x faster`
+                        : 'Service not running'}
+                  </div>
+                </button>
+
+                <button
+                  onClick={() => setExportMode('browser')}
+                  className={`py-2.5 px-3 rounded-lg text-sm font-medium transition-colors text-left
+                    ${exportMode === 'browser'
+                      ? 'bg-blue-700/50 border border-blue-500/60 text-blue-200'
+                      : 'bg-gray-800 text-gray-400 hover:bg-gray-700 border border-gray-700'}`}
+                >
+                  <div className="flex items-center gap-1.5">
+                    <svg className="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9" />
+                    </svg>
+                    Browser
+                  </div>
+                  <div className="text-[10px] mt-0.5 opacity-70">
+                    {hasWebCodecs ? 'WebCodecs H.264' : 'WebM capture'}
+                  </div>
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Local service setup hint */}
+          {isBrowser && !isExporting && exportMode === 'local' && !localInfo?.available && !checkingLocal && (
+            <div className="bg-amber-900/20 border border-amber-800/40 rounded-lg px-3 py-2.5 text-xs text-amber-300 space-y-1.5">
+              <p className="font-medium">Local FFmpeg service not detected</p>
+              <p className="text-amber-400/80">To enable fast export, run the service:</p>
+              <pre className="bg-black/30 rounded px-2 py-1.5 text-[11px] text-amber-200/90 font-mono overflow-x-auto">
+{`cd export-service
+pip install -r requirements.txt
+python server.py`}
+              </pre>
+              <p className="text-amber-400/60">Requires Python 3.10+ and FFmpeg installed on your system.</p>
+            </div>
+          )}
+
+          {/* Local service active banner */}
+          {isBrowser && !isExporting && exportMode === 'local' && localInfo?.available && (
+            <div className="bg-emerald-900/20 border border-emerald-800/40 rounded-lg px-3 py-2 text-xs text-emerald-300">
+              <p className="font-medium mb-0.5">Native FFmpeg Export</p>
+              <p className="text-emerald-400/80">
+                Using <span className="font-mono">{localInfo.encoder}</span> encoder with hardware acceleration.
+                Files are processed locally — nothing leaves your machine.
               </p>
             </div>
           )}
-          {isBrowser && !hasWebCodecs && (
+
+          {/* Browser mode notice */}
+          {isBrowser && !isExporting && exportMode === 'browser' && hasWebCodecs && (
+            <div className="bg-blue-900/20 border border-blue-800/40 rounded-lg px-3 py-2 text-xs text-blue-300">
+              <p className="font-medium mb-0.5">Browser Export (H.264 + AAC)</p>
+              <p className="text-blue-400/80">
+                Uses WebCodecs for encoding. Slower than local FFmpeg but requires no setup.
+              </p>
+            </div>
+          )}
+          {isBrowser && !isExporting && exportMode === 'browser' && !hasWebCodecs && (
             <div className="bg-yellow-900/20 border border-yellow-800/40 rounded-lg px-3 py-2 text-xs text-yellow-300">
               <p className="font-medium mb-0.5">Browser Export Mode</p>
               <p className="text-yellow-400/80">
@@ -135,7 +264,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
                 <button
                   key={fmt}
                   onClick={() => setExportSettings({ format: fmt })}
-                  disabled={isExporting}
+                  disabled={isExporting || (exportMode === 'local' && fmt === 'webm')}
                   className={`py-2 rounded-lg text-sm font-medium transition-colors uppercase
                     ${exportSettings.format === fmt
                       ? 'bg-blue-600 text-white'
@@ -143,7 +272,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
                     disabled:opacity-50 disabled:cursor-not-allowed`}
                 >
                   {fmt}
-                  {fmt === 'mp4' && isBrowser && (
+                  {fmt === 'mp4' && exportMode === 'local' && (
+                    <span className="text-[10px] ml-1 opacity-70 normal-case">(H.264+AAC)</span>
+                  )}
+                  {fmt === 'mp4' && exportMode === 'browser' && isBrowser && (
                     <span className="text-[10px] ml-1 opacity-70 normal-case">(H.264+AAC)</span>
                   )}
                 </button>
@@ -223,7 +355,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
                       <div key={i} className="flex items-center gap-1.5">
                         <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0
                           ${isDone ? 'bg-green-600 text-white' : isActive ? 'bg-blue-500 text-white animate-pulse' : 'bg-gray-700 text-gray-500'}`}>
-                          {isDone ? '✓' : stepNum}
+                          {isDone ? '\u2713' : stepNum}
                         </div>
                         {i < exportStatus.totalSteps - 1 && (
                           <div className={`h-0.5 w-4 rounded ${isDone ? 'bg-green-600' : 'bg-gray-700'}`} />
@@ -237,10 +369,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
               {/* Phase & detail */}
               <div>
                 <div className="flex justify-between items-baseline mb-1">
-                  <span className="text-sm font-medium text-blue-400">{exportStatus?.phase || 'Exporting…'}</span>
+                  <span className="text-sm font-medium text-blue-400">{exportStatus?.phase || 'Exporting\u2026'}</span>
                   <span className="text-xs font-mono text-gray-400">{exportProgress}%</span>
                 </div>
-                <p className="text-xs text-gray-500">{exportStatus?.detail || statusMessage || 'Preparing…'}</p>
+                <p className="text-xs text-gray-500">{exportStatus?.detail || statusMessage || 'Preparing\u2026'}</p>
               </div>
 
               {/* Progress bar */}
@@ -257,19 +389,24 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
                   <span>
                     {exportStatus.currentFrame != null && exportStatus.totalFrames != null
                       ? `Frame ${exportStatus.currentFrame} / ${exportStatus.totalFrames}`
-                      : `Step ${exportStatus.step} / ${exportStatus.totalSteps}`}
+                      : exportStatus.currentFrame != null
+                        ? `Frame ${exportStatus.currentFrame}`
+                        : `Step ${exportStatus.step} / ${exportStatus.totalSteps}`}
                   </span>
                   <span>
                     {formatMs(exportStatus.elapsedMs)} elapsed
                     {exportStatus.estimatedTotalMs != null && exportStatus.estimatedTotalMs > exportStatus.elapsedMs && (
-                      <> · ~{formatMs(exportStatus.estimatedTotalMs - exportStatus.elapsedMs)} left</>
+                      <> &middot; ~{formatMs(exportStatus.estimatedTotalMs - exportStatus.elapsedMs)} left</>
+                    )}
+                    {exportStatus.fps != null && exportStatus.fps > 0 && (
+                      <> &middot; {exportStatus.fps.toFixed(0)} fps</>
                     )}
                   </span>
                 </div>
               )}
 
-              {/* Sleep protection status */}
-              {lockState && (
+              {/* Sleep protection status (only for browser export) */}
+              {lockState && exportMode === 'browser' && (
                 <div className="bg-gray-800/60 rounded-lg px-3 py-2 space-y-1.5">
                   <p className="text-[11px] font-medium text-gray-400">Sleep Protection Active</p>
                   <div className="flex flex-wrap gap-x-3 gap-y-1">
@@ -313,7 +450,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
               disabled={!canExport}
               className={`flex-1 py-2.5 rounded-lg text-sm font-medium transition-colors flex items-center justify-center gap-2
                 ${canExport
-                  ? 'bg-blue-600 hover:bg-blue-500 text-white'
+                  ? exportMode === 'local' && localInfo?.available
+                    ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                    : 'bg-blue-600 hover:bg-blue-500 text-white'
                   : 'bg-gray-800 text-gray-600 cursor-not-allowed'}`}
             >
               {isExporting ? (
@@ -326,10 +465,16 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
                 </>
               ) : (
                 <>
-                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                  </svg>
-                  Export
+                  {exportMode === 'local' && localInfo?.available ? (
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                    </svg>
+                  ) : (
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                    </svg>
+                  )}
+                  {exportMode === 'local' && localInfo?.available ? 'Fast Export' : 'Export'}
                 </>
               )}
             </button>

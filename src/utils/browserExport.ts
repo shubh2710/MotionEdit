@@ -7,6 +7,7 @@ import {
   renderTransition, loadImage as loadOverlayImage, preloadOverlayImages,
 } from './overlayRenderer';
 import { acquireExportLock, releaseExportLock, setExportProgress } from './exportWakeLock';
+import { VideoElementFrameProvider, type FrameProvider } from './videoDemuxer';
 
 export interface ExportStatus {
   phase: string;
@@ -114,13 +115,17 @@ function computeTotalDuration(data: ExportData): number {
   return maxEnd;
 }
 
+function getSourceTimeForClip(clip: Clip, timelineTime: number): number {
+  return clip.start + Math.max(0, timelineTime - clip.offset) * clip.speed;
+}
+
 function renderFrame(
   ctx: CanvasRenderingContext2D,
   w: number,
   h: number,
   time: number,
   data: ExportData,
-  videoEls: Map<string, HTMLVideoElement>,
+  frameProviders: Map<string, FrameProvider>,
   imageEls: Map<string, HTMLImageElement>,
 ) {
   ctx.fillStyle = '#000000';
@@ -138,12 +143,18 @@ function renderFrame(
     const overlapStart = Math.max(fromEnd - tr.duration, to.offset);
 
     if (time >= overlapStart && time <= fromEnd) {
-      const fromEl = from.type === 'image' ? imageEls.get(from.sourcePath) : videoEls.get(from.sourcePath);
-      const toEl = to.type === 'image' ? imageEls.get(to.sourcePath) : videoEls.get(to.sourcePath);
+      let fromSource: CanvasImageSource | null = null;
+      let toSource: CanvasImageSource | null = null;
+
+      if (from.type === 'image') fromSource = imageEls.get(from.sourcePath) ?? null;
+      else if (from.type === 'video') fromSource = frameProviders.get(from.sourcePath)?.getFrameAt(getSourceTimeForClip(from, time)) ?? null;
+
+      if (to.type === 'image') toSource = imageEls.get(to.sourcePath) ?? null;
+      else if (to.type === 'video') toSource = frameProviders.get(to.sourcePath)?.getFrameAt(getSourceTimeForClip(to, time)) ?? null;
+
       drewTransition = renderTransition(
         ctx, tr, from, to,
-        (fromEl as HTMLVideoElement | HTMLImageElement) || null,
-        (toEl as HTMLVideoElement | HTMLImageElement) || null,
+        fromSource, toSource,
         w, h, time,
       );
       if (drewTransition) break;
@@ -159,8 +170,10 @@ function renderFrame(
         const img = imageEls.get(vis.sourcePath);
         if (img) drawFit(ctx, img, w, h);
       } else if (vis.type === 'video') {
-        const vid = videoEls.get(vis.sourcePath);
-        if (vid) drawFit(ctx, vid, w, h);
+        const provider = frameProviders.get(vis.sourcePath);
+        const srcTime = getSourceTimeForClip(vis, time);
+        const source = provider?.getFrameAt(srcTime);
+        if (source) drawFit(ctx, source, w, h);
       }
     }
   }
@@ -200,12 +213,13 @@ async function exportMP4WebCodecs(
 
   const elapsed = () => performance.now() - exportStart;
 
-  // ── Step 1: Load media assets ──
+  // ── Step 1: Load & demux media assets ──
   onProgress(0);
   const mediaCount = sortedClips.filter((c) => c.type !== 'blank').length;
   onStatus({ phase: 'Loading media', detail: `Preparing ${mediaCount} clip(s)…`, step: 1, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
 
-  const videoEls = new Map<string, HTMLVideoElement>();
+  const frameProviders = new Map<string, FrameProvider>();
+  const fallbackVideoEls = new Map<string, HTMLVideoElement>();
   const imageEls = new Map<string, HTMLImageElement>();
   let loadedCount = 0;
 
@@ -216,13 +230,14 @@ async function exportMP4WebCodecs(
       img.src = clip.sourcePath;
       await loadImg(img);
       imageEls.set(clip.sourcePath, img);
-    } else if ((clip.type === 'video' || clip.type === 'audio') && !videoEls.has(clip.sourcePath)) {
+    } else if ((clip.type === 'video' || clip.type === 'audio') && !frameProviders.has(clip.sourcePath)) {
       const el = document.createElement('video');
       el.preload = 'auto';
       el.muted = true;
       el.src = clip.sourcePath;
       await loadMediaElement(el);
-      videoEls.set(clip.sourcePath, el);
+      fallbackVideoEls.set(clip.sourcePath, el);
+      frameProviders.set(clip.sourcePath, new VideoElementFrameProvider(el));
     }
     loadedCount++;
     onStatus({ phase: 'Loading media', detail: `Loaded ${loadedCount} / ${mediaCount} assets`, step: 1, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
@@ -276,7 +291,7 @@ async function exportMP4WebCodecs(
   videoEncoder.configure({
     codec: finalCodec, width: w, height: h,
     bitrate: videoBitrate, framerate: fps,
-    latencyMode: 'realtime', avc: { format: 'avc' },
+    latencyMode: 'quality', avc: { format: 'avc' },
   });
 
   const canvas = document.createElement('canvas');
@@ -285,7 +300,6 @@ async function exportMP4WebCodecs(
   const ctx = canvas.getContext('2d')!;
   const totalFrames = Math.ceil(totalDuration * fps);
   const keyFrameInterval = fps * 2;
-  const frameDuration = 1 / fps;
   const encodeStart = performance.now();
 
   onStatus({
@@ -295,29 +309,24 @@ async function exportMP4WebCodecs(
   });
 
   let prevClipId = '';
+  const hasFallbacks = fallbackVideoEls.size > 0;
 
   for (let fi = 0; fi < totalFrames; fi++) {
     const time = fi / fps;
 
-    const vis = findActiveVisualClip(sortedClips, tracks, time);
-    if (vis && vis.type === 'video') {
-      const vid = videoEls.get(vis.sourcePath);
-      if (vid) {
+    // For fallback HTMLVideoElement sources, we still need to seek
+    if (hasFallbacks) {
+      const vis = findActiveVisualClip(sortedClips, tracks, time);
+      if (vis && vis.type === 'video' && fallbackVideoEls.has(vis.sourcePath)) {
+        const vid = fallbackVideoEls.get(vis.sourcePath)!;
         const targetTime = vis.start + Math.max(0, time - vis.offset) * vis.speed;
-        const drift = Math.abs(vid.currentTime - targetTime);
-
-        if (vis.id !== prevClipId || drift > 1.0) {
-          await seekVideoFull(vid, targetTime);
-        } else if (drift > frameDuration * 0.4) {
-          seekVideoFast(vid, targetTime);
-        }
+        const isClipChange = vis.id !== prevClipId;
+        await seekVideoExact(vid, targetTime, isClipChange);
       }
-      prevClipId = vis.id;
-    } else {
       prevClipId = vis?.id || '';
     }
 
-    renderFrame(ctx, w, h, time, data, videoEls, imageEls);
+    renderFrame(ctx, w, h, time, data, frameProviders, imageEls);
 
     const frame = new VideoFrame(canvas, { timestamp: Math.round(time * 1_000_000) });
     videoEncoder.encode(frame, { keyFrame: fi % keyFrameInterval === 0 });
@@ -327,6 +336,7 @@ async function exportMP4WebCodecs(
       await waitForEncoderDrain(videoEncoder, 5);
     }
 
+    // Periodically free consumed frames to limit memory
     if (fi % 30 === 0) {
       const pct = 10 + Math.round((fi / totalFrames) * 60);
       onProgress(pct);
@@ -384,7 +394,7 @@ async function exportMP4WebCodecs(
     onStatus({ phase: 'Adding audio', detail: 'No audio to include', step: 5, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
   }
 
-  videoEls.forEach((el) => { el.pause(); el.removeAttribute('src'); el.load(); });
+  fallbackVideoEls.forEach((el) => { el.pause(); el.removeAttribute('src'); el.load(); });
 
   const finalSizeMB = (finalBlob.size / 1024 / 1024).toFixed(1);
   const totalSec = (elapsed() / 1000).toFixed(1);
@@ -583,6 +593,8 @@ async function captureWebM(
     recorder.start(100);
 
     const startWall = performance.now();
+    const webmProviders = new Map<string, FrameProvider>();
+    videoEls.forEach((el, key) => webmProviders.set(key, new VideoElementFrameProvider(el)));
 
     function render() {
       const elapsed = (performance.now() - startWall) / 1000;
@@ -595,7 +607,7 @@ async function captureWebM(
 
       onProgress(Math.min(0.99, elapsed / totalDuration));
 
-      renderFrame(ctx, w, h, elapsed, data, videoEls, imageEls);
+      renderFrame(ctx, w, h, elapsed, data, webmProviders, imageEls);
 
       for (const { clip, element, gainNode } of states) {
         if (clip.type === 'blank' || clip.type === 'image') continue;
@@ -803,27 +815,29 @@ function findActiveVisualClip(clips: Clip[], tracks: Track[], time: number): Cli
   });
 }
 
-function drawFit(ctx: CanvasRenderingContext2D, source: HTMLVideoElement | HTMLImageElement, cw: number, ch: number) {
-  const sw = source instanceof HTMLVideoElement ? source.videoWidth : source.naturalWidth;
-  const sh = source instanceof HTMLVideoElement ? source.videoHeight : source.naturalHeight;
+function drawFit(ctx: CanvasRenderingContext2D, source: CanvasImageSource, cw: number, ch: number) {
+  let sw = 0, sh = 0;
+  if (source instanceof HTMLVideoElement) { sw = source.videoWidth; sh = source.videoHeight; }
+  else if (source instanceof HTMLImageElement) { sw = source.naturalWidth; sh = source.naturalHeight; }
+  else if (source instanceof ImageBitmap) { sw = source.width; sh = source.height; }
+  else if (source instanceof VideoFrame) { sw = (source as VideoFrame).displayWidth; sh = (source as VideoFrame).displayHeight; }
   if (sw === 0 || sh === 0) return;
   const scale = Math.min(cw / sw, ch / sh);
   const dw = sw * scale, dh = sh * scale;
   ctx.drawImage(source, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
 }
 
-function seekVideoFull(video: HTMLVideoElement, time: number): Promise<void> {
+function seekVideoExact(video: HTMLVideoElement, time: number, isClipChange: boolean): Promise<void> {
   return new Promise((resolve) => {
-    if (Math.abs(video.currentTime - time) < 0.02) { resolve(); return; }
-    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); clearTimeout(t); resolve(); };
-    video.addEventListener('seeked', onSeeked);
-    video.currentTime = time;
-    const t = setTimeout(resolve, 80);
-  });
-}
+    const diff = Math.abs(video.currentTime - time);
+    if (diff < 0.015) { resolve(); return; }
 
-function seekVideoFast(video: HTMLVideoElement, time: number) {
-  video.currentTime = time;
+    const timeout = isClipChange ? 150 : 50;
+    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); clearTimeout(t); resolve(); };
+    video.addEventListener('seeked', onSeeked, { once: true });
+    video.currentTime = time;
+    const t = setTimeout(resolve, timeout);
+  });
 }
 
 function waitForEncoderDrain(encoder: VideoEncoder, target: number): Promise<void> {
