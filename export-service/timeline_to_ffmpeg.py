@@ -361,10 +361,10 @@ def build_ffmpeg_command(
         filters.append(f"[{current_video}]{dt}[{merged}]")
         current_video = merged
 
-    # Step 5: Final — force exact constant frame rate with monotonic timestamps
+    # Step 5: Final — normalize frame rate and reset timestamps
     final_lbl = next_label("vout")
     filters.append(
-        f"[{current_video}]settb=1/{fps},fps={fps},setpts=N/TB[{final_lbl}]"
+        f"[{current_video}]fps={fps},setpts=N/FRAME_RATE/TB[{final_lbl}]"
     )
     current_video = final_lbl
 
