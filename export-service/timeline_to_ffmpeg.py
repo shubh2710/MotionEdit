@@ -159,17 +159,22 @@ def build_ffmpeg_command(
         if c.get("type") == "image":
             filters.append(
                 f"[{idx}:v]loop=loop={int(dur * fps)}:size=1:start=0,"
-                f"setpts=PTS-STARTPTS,scale={w}:{h}:force_original_aspect_ratio=decrease,"
-                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}"
+                f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+                f"fps={fps},setpts=N/{fps}/TB"
                 f"[{lbl}]"
             )
         else:
-            trim_filter = f"[{idx}:v]trim=start={start:.4f}:duration={dur * speed:.4f},setpts=PTS-STARTPTS"
             if abs(speed - 1.0) > 0.01:
-                trim_filter += f",setpts=PTS/{speed:.4f}"
-            trim_filter += (
-                f",scale={w}:{h}:force_original_aspect_ratio=decrease,"
-                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps}"
+                setpts_expr = f"(PTS-STARTPTS)/{speed:.4f}"
+            else:
+                setpts_expr = "PTS-STARTPTS"
+            trim_filter = (
+                f"[{idx}:v]trim=start={start:.4f}:duration={dur * speed:.4f},"
+                f"setpts={setpts_expr},"
+                f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
+                f"fps={fps},setpts=N/{fps}/TB"
                 f"[{lbl}]"
             )
             filters.append(trim_filter)
@@ -348,7 +353,12 @@ def build_ffmpeg_command(
         filters.append(f"[{current_video}]{dt}[{merged}]")
         current_video = merged
 
-    # Step 5: Audio mix
+    # Step 5: Final timestamp normalization for smooth playback
+    final_lbl = next_label("vfinal")
+    filters.append(f"[{current_video}]fps={fps},setpts=N/{fps}/TB[{final_lbl}]")
+    current_video = final_lbl
+
+    # Step 6: Audio mix
     audio_parts: list[str] = []
     audio_labels: list[str] = []
 
@@ -429,7 +439,7 @@ def build_ffmpeg_command(
     else:
         cmd.extend(["-preset", "fast", "-crf", "18"])
 
-    cmd.extend(["-r", str(fps), "-s", f"{w}x{h}", "-pix_fmt", "yuv420p"])
+    cmd.extend(["-r", str(fps), "-vsync", "cfr", "-pix_fmt", "yuv420p"])
 
     if has_audio and audio_output:
         cmd.extend(["-c:a", "aac", "-b:a", "192k"])
