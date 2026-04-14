@@ -106,6 +106,11 @@ async def start_export(
             content = await f.read()
             out.write(content)
         file_map[f.filename] = str(dest)
+        file_map[safe_name] = str(dest)
+
+    print(f"[{job_id}] Received {len(files)} file(s): {list(file_map.keys())}")
+    clips_info = [(c.get("sourcePath",""), c.get("sourceName","")) for c in timeline_data.get("clips", []) if c.get("type") != "blank"]
+    print(f"[{job_id}] Timeline clips sourcePaths: {clips_info}")
 
     output_path = job_dir / "output.mp4"
     progress_path = job_dir / "progress.log"

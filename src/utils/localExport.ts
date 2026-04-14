@@ -41,19 +41,10 @@ export async function exportViaLocalService(
   // Build FormData with timeline JSON and all media files
   const formData = new FormData();
 
-  const timeline = {
-    clips: data.clips,
-    tracks: data.tracks,
-    textOverlays: data.textOverlays,
-    imageOverlays: data.imageOverlays,
-    transitions: data.transitions,
-    settings: data.settings,
-  };
-  formData.append('timeline', JSON.stringify(timeline));
-
-  // Collect unique source paths and upload them
+  // Collect unique source paths, upload them, and build a blob-URL -> filename map
   const uploaded = new Set<string>();
   const allSources: { path: string; name: string }[] = [];
+  const pathToFileName: Record<string, string> = {};
 
   for (const clip of data.clips) {
     if (clip.type === 'blank' || !clip.sourcePath) continue;
@@ -77,10 +68,31 @@ export async function exportViaLocalService(
       const ext = guessExtension(blob.type, source.name);
       const fileName = sanitizeName(source.name, ext);
       formData.append('files', blob, fileName);
+      pathToFileName[source.path] = fileName;
     } catch (err) {
       console.warn('[LocalExport] Failed to fetch source:', source.path, err);
     }
   }
+
+  // Rewrite timeline so sourcePath/src use the uploaded filenames instead of blob URLs
+  const rewrittenClips = data.clips.map((c) => ({
+    ...c,
+    sourcePath: pathToFileName[c.sourcePath] || c.sourcePath,
+  }));
+  const rewrittenImageOverlays = data.imageOverlays.map((io) => ({
+    ...io,
+    src: pathToFileName[io.src] || io.src,
+  }));
+
+  const timeline = {
+    clips: rewrittenClips,
+    tracks: data.tracks,
+    textOverlays: data.textOverlays,
+    imageOverlays: rewrittenImageOverlays,
+    transitions: data.transitions,
+    settings: data.settings,
+  };
+  formData.append('timeline', JSON.stringify(timeline));
 
   onProgress(5);
   onStatus({ phase: 'Uploading', detail: 'Sending to FFmpeg service…', step: 2, totalSteps: 4, elapsedMs: elapsed() });
