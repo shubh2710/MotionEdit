@@ -6,8 +6,10 @@ import {
   duplicateProject, importProjectFromFile, exportProjectToFile,
 } from '../utils/projectStorage';
 import { generateId } from '../utils/helpers';
+import { APP_VERSION, APP_NAME, CHANGELOG } from '../version';
 
 export const ProjectDashboard: React.FC = () => {
+  const [showChangelog, setShowChangelog] = useState(false);
   const { newProject, loadProjectById } = useEditorStore();
   const [projects, setProjects] = useState<ProjectMeta[]>([]);
   const [loading, setLoading] = useState(true);
@@ -108,11 +110,46 @@ export const ProjectDashboard: React.FC = () => {
                 <svg className="w-8 h-8 text-blue-400" fill="currentColor" viewBox="0 0 20 20">
                   <path d="M4 3a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V5a2 2 0 00-2-2H4zm12 12H4l4-8 3 6 2-4 3 6z" />
                 </svg>
-                <h1 className="text-2xl font-bold">Desktop Video Editor</h1>
+                <h1 className="text-2xl font-bold">{APP_NAME}</h1>
               </div>
               <p className="text-gray-500 text-sm">Create, edit, and export professional videos</p>
             </div>
+            <button
+              onClick={() => setShowChangelog(!showChangelog)}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-gray-800/60 border border-gray-700/50 hover:border-gray-600 transition-colors text-xs text-gray-400 hover:text-gray-200"
+            >
+              <span className="w-2 h-2 rounded-full bg-green-500" />
+              v{APP_VERSION}
+            </button>
           </div>
+
+          {/* Changelog */}
+          {showChangelog && (
+            <div className="mb-6 p-4 bg-gray-900 rounded-xl border border-gray-800 animate-in fade-in">
+              <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold text-gray-300">Changelog</h3>
+                <button onClick={() => setShowChangelog(false)} className="text-gray-500 hover:text-gray-300 text-xs">Close</button>
+              </div>
+              <div className="space-y-4 max-h-60 overflow-y-auto pr-2">
+                {CHANGELOG.map((entry) => (
+                  <div key={entry.version}>
+                    <div className="flex items-center gap-2 mb-1.5">
+                      <span className="text-xs font-mono font-bold text-blue-400">v{entry.version}</span>
+                      <span className="text-[10px] text-gray-600">{entry.date}</span>
+                    </div>
+                    <ul className="space-y-0.5">
+                      {entry.changes.map((change, i) => (
+                        <li key={i} className="text-xs text-gray-400 flex items-start gap-2">
+                          <span className="text-gray-600 mt-0.5">-</span>
+                          <span>{change}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Actions */}
           <div className="grid grid-cols-3 gap-4 mb-8">
@@ -235,6 +272,13 @@ export const ProjectDashboard: React.FC = () => {
             )}
           </div>
         </div>
+      </div>
+
+      {/* Footer */}
+      <div className="flex items-center justify-center gap-4 px-6 py-3 border-t border-gray-800/50 text-[11px] text-gray-600">
+        <span>{APP_NAME} v{APP_VERSION}</span>
+        <span className="text-gray-800">|</span>
+        <span>Built with React + FFmpeg</span>
       </div>
     </div>
   );

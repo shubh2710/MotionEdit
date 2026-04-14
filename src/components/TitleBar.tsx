@@ -1,4 +1,5 @@
 import React from 'react';
+import { APP_NAME, APP_VERSION } from '../version';
 
 const isElectron = typeof window !== 'undefined' && window.electronAPI;
 
@@ -12,7 +13,8 @@ export const TitleBar: React.FC = () => {
         <svg className="w-4 h-4 text-blue-400" fill="currentColor" viewBox="0 0 20 20">
           <path d="M4 3a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V5a2 2 0 00-2-2H4zm12 12H4l4-8 3 6 2-4 3 6z" />
         </svg>
-        <span className="text-xs font-medium text-gray-400">Desktop Video Editor</span>
+        <span className="text-xs font-medium text-gray-400">{APP_NAME}</span>
+        <span className="text-[10px] text-gray-600">v{APP_VERSION}</span>
       </div>
       <div className="flex items-center gap-1" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
         <button onClick={() => window.electronAPI?.minimizeWindow()}

@@ -1,5 +1,6 @@
 import type { ExportData, ExportCallbacks } from './browserExport';
 import { downloadBlob } from './browserExport';
+import { acquireExportLock, releaseExportLock, setExportProgress } from './exportWakeLock';
 
 const SERVICE_URL = 'http://localhost:9876';
 
@@ -31,9 +32,24 @@ export async function exportViaLocalService(
   data: ExportData,
   callbacks: ExportCallbacks,
 ): Promise<void> {
-  const { onProgress, onStatus, onComplete, onError } = callbacks;
+  const { onProgress: rawOnProgress, onStatus, onComplete: rawOnComplete, onError: rawOnError } = callbacks;
   const exportStart = performance.now();
   const elapsed = () => performance.now() - exportStart;
+
+  await acquireExportLock();
+
+  const onProgress = (pct: number) => {
+    rawOnProgress(pct);
+    setExportProgress(pct, 'Exporting');
+  };
+  const onComplete = (blob: Blob, filename: string) => {
+    releaseExportLock();
+    rawOnComplete(blob, filename);
+  };
+  const onError = (error: string) => {
+    releaseExportLock();
+    rawOnError(error);
+  };
 
   onProgress(0);
   onStatus({ phase: 'Preparing', detail: 'Collecting media files…', step: 1, totalSteps: 4, elapsedMs: 0 });
