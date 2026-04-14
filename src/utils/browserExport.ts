@@ -6,9 +6,23 @@ import {
   renderTextOverlay, renderImageOverlay, renderBlankClip,
   renderTransition, loadImage as loadOverlayImage, preloadOverlayImages,
 } from './overlayRenderer';
+import { acquireExportLock, releaseExportLock, setExportProgress } from './exportWakeLock';
+
+export interface ExportStatus {
+  phase: string;
+  detail: string;
+  step: number;
+  totalSteps: number;
+  currentFrame?: number;
+  totalFrames?: number;
+  fps?: number;
+  elapsedMs: number;
+  estimatedTotalMs?: number;
+}
 
 export interface ExportCallbacks {
   onProgress: (percent: number) => void;
+  onStatus: (status: ExportStatus) => void;
   onComplete: (blob: Blob, filename: string) => void;
   onError: (error: string) => void;
 }
@@ -39,6 +53,30 @@ export async function browserExportVideo(
     return;
   }
 
+  // Acquire wake lock to prevent tab suspension / OS sleep
+  const lockState = await acquireExportLock();
+  console.log('[Export] Wake lock acquired:', lockState);
+
+  const wrappedCallbacks: ExportCallbacks = {
+    ...callbacks,
+    onProgress: (percent) => {
+      callbacks.onProgress(percent);
+    },
+    onStatus: (status) => {
+      callbacks.onStatus(status);
+      setExportProgress(Math.round(status.elapsedMs > 0 ? (status.currentFrame ?? status.step) / (status.totalFrames ?? status.totalSteps) * 100 : 0), status.phase);
+    },
+    onComplete: (blob, filename) => {
+      setExportProgress(100, 'Complete');
+      releaseExportLock();
+      callbacks.onComplete(blob, filename);
+    },
+    onError: (error) => {
+      releaseExportLock();
+      callbacks.onError(error);
+    },
+  };
+
   preloadOverlayImages(imageOverlays);
   for (const io of imageOverlays) {
     try { await loadOverlayImage(io.src); } catch {}
@@ -54,12 +92,17 @@ export async function browserExportVideo(
     format: settings.format, userAgent: navigator.userAgent,
   });
 
-  if (hasWebCodecs && wantMP4) {
-    await exportMP4WebCodecs(data, callbacks);
-  } else if (wantMP4) {
-    await exportMP4ViaWebM(data, callbacks);
-  } else {
-    await exportWebM(data, callbacks);
+  try {
+    if (hasWebCodecs && wantMP4) {
+      await exportMP4WebCodecs(data, wrappedCallbacks);
+    } else if (wantMP4) {
+      await exportMP4ViaWebM(data, wrappedCallbacks);
+    } else {
+      await exportWebM(data, wrappedCallbacks);
+    }
+  } catch (err) {
+    releaseExportLock();
+    throw err;
   }
 }
 
@@ -140,7 +183,7 @@ function renderFrame(
 // PATH A: WebCodecs H.264 + ffmpeg.wasm AAC → MP4
 async function exportMP4WebCodecs(
   data: ExportData,
-  { onProgress, onComplete, onError }: ExportCallbacks,
+  { onProgress, onStatus, onComplete, onError }: ExportCallbacks,
 ) {
   const { clips, tracks, settings } = data;
   const [w, h] = settings.resolution.split('x').map(Number);
@@ -150,18 +193,21 @@ async function exportMP4WebCodecs(
 
   const sortedClips = [...clips].sort((a, b) => a.offset - b.offset);
   const totalDuration = computeTotalDuration(data);
+  const TOTAL_STEPS = 5;
+  const exportStart = performance.now();
 
   if (totalDuration <= 0) { onError('Timeline is empty'); return; }
 
-  console.log('[Export] MP4 via WebCodecs + ffmpeg.wasm', {
-    resolution: `${w}x${h}`, fps, duration: totalDuration.toFixed(2) + 's',
-    clips: sortedClips.length, textOverlays: data.textOverlays.length, imageOverlays: data.imageOverlays.length,
-  });
+  const elapsed = () => performance.now() - exportStart;
 
+  // ── Step 1: Load media assets ──
   onProgress(0);
+  const mediaCount = sortedClips.filter((c) => c.type !== 'blank').length;
+  onStatus({ phase: 'Loading media', detail: `Preparing ${mediaCount} clip(s)…`, step: 1, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
 
   const videoEls = new Map<string, HTMLVideoElement>();
   const imageEls = new Map<string, HTMLImageElement>();
+  let loadedCount = 0;
 
   for (const clip of sortedClips) {
     if (clip.type === 'blank') continue;
@@ -178,28 +224,38 @@ async function exportMP4WebCodecs(
       await loadMediaElement(el);
       videoEls.set(clip.sourcePath, el);
     }
+    loadedCount++;
+    onStatus({ phase: 'Loading media', detail: `Loaded ${loadedCount} / ${mediaCount} assets`, step: 1, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
+    onProgress(Math.round((loadedCount / mediaCount) * 5));
   }
+
+  // ── Step 2: Render audio ──
+  onStatus({ phase: 'Processing audio', detail: 'Decoding audio tracks…', step: 2, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
+  onProgress(6);
 
   let renderedAudio: AudioBuffer | null = null;
   try {
     renderedAudio = await renderAudioOffline(sortedClips, tracks, totalDuration);
     const rms = computeRMS(renderedAudio);
-    console.log('[Export] Offline audio rendered, RMS:', rms.toFixed(6));
     if (rms < 0.0001) { renderedAudio = null; }
-  } catch (err) {
-    console.warn('[Export] Offline audio rendering failed:', err);
+    onStatus({ phase: 'Processing audio', detail: renderedAudio ? 'Audio decoded successfully' : 'No audible audio detected', step: 2, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
+  } catch {
+    onStatus({ phase: 'Processing audio', detail: 'Offline decode failed, trying real-time capture…', step: 2, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
   }
 
   if (!renderedAudio) {
     try {
-      renderedAudio = await captureAudioRealTime(sortedClips, tracks, totalDuration, (p) => onProgress(Math.round(p * 10)));
+      renderedAudio = await captureAudioRealTime(sortedClips, tracks, totalDuration, (p) => {
+        onProgress(6 + Math.round(p * 4));
+        onStatus({ phase: 'Processing audio', detail: `Real-time capture… ${Math.round(p * 100)}%`, step: 2, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
+      });
       const rms = computeRMS(renderedAudio);
       if (rms < 0.0001) { renderedAudio = null; }
-    } catch (err) {
-      console.warn('[Export] Real-time audio capture failed:', err);
-    }
+    } catch {}
   }
+  onProgress(10);
 
+  // ── Step 3: Encode video frames ──
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     video: { codec: 'avc', width: w, height: h },
@@ -220,7 +276,7 @@ async function exportMP4WebCodecs(
   videoEncoder.configure({
     codec: finalCodec, width: w, height: h,
     bitrate: videoBitrate, framerate: fps,
-    latencyMode: 'quality', avc: { format: 'avc' },
+    latencyMode: 'realtime', avc: { format: 'avc' },
   });
 
   const canvas = document.createElement('canvas');
@@ -229,8 +285,16 @@ async function exportMP4WebCodecs(
   const ctx = canvas.getContext('2d')!;
   const totalFrames = Math.ceil(totalDuration * fps);
   const keyFrameInterval = fps * 2;
+  const frameDuration = 1 / fps;
+  const encodeStart = performance.now();
 
-  console.log('[Export] Encoding', totalFrames, 'video frames...');
+  onStatus({
+    phase: 'Encoding video', detail: `0 / ${totalFrames} frames (${w}×${h} @ ${fps}fps)`,
+    step: 3, totalSteps: TOTAL_STEPS, currentFrame: 0, totalFrames, fps,
+    elapsedMs: elapsed(),
+  });
+
+  let prevClipId = '';
 
   for (let fi = 0; fi < totalFrames; fi++) {
     const time = fi / fps;
@@ -238,7 +302,19 @@ async function exportMP4WebCodecs(
     const vis = findActiveVisualClip(sortedClips, tracks, time);
     if (vis && vis.type === 'video') {
       const vid = videoEls.get(vis.sourcePath);
-      if (vid) await seekVideo(vid, vis.start + (time - vis.offset) * vis.speed);
+      if (vid) {
+        const targetTime = vis.start + Math.max(0, time - vis.offset) * vis.speed;
+        const drift = Math.abs(vid.currentTime - targetTime);
+
+        if (vis.id !== prevClipId || drift > 1.0) {
+          await seekVideoFull(vid, targetTime);
+        } else if (drift > frameDuration * 0.4) {
+          seekVideoFast(vid, targetTime);
+        }
+      }
+      prevClipId = vis.id;
+    } else {
+      prevClipId = vis?.id || '';
     }
 
     renderFrame(ctx, w, h, time, data, videoEls, imageEls);
@@ -247,80 +323,140 @@ async function exportMP4WebCodecs(
     videoEncoder.encode(frame, { keyFrame: fi % keyFrameInterval === 0 });
     frame.close();
 
-    if (fi % 5 === 0) {
-      onProgress(10 + Math.round((fi / totalFrames) * 60));
+    if (videoEncoder.encodeQueueSize > 15) {
+      await waitForEncoderDrain(videoEncoder, 5);
+    }
+
+    if (fi % 30 === 0) {
+      const pct = 10 + Math.round((fi / totalFrames) * 60);
+      onProgress(pct);
+
+      const encodeElapsed = performance.now() - encodeStart;
+      const framesPerMs = (fi + 1) / encodeElapsed;
+      const remainingFrames = totalFrames - fi - 1;
+      const estimatedTotalMs = elapsed() + (remainingFrames / framesPerMs);
+      const encodeFps = ((fi + 1) / (encodeElapsed / 1000)).toFixed(1);
+
+      onStatus({
+        phase: 'Encoding video',
+        detail: `Frame ${fi + 1} / ${totalFrames} · ${encodeFps} fps`,
+        step: 3, totalSteps: TOTAL_STEPS,
+        currentFrame: fi + 1, totalFrames, fps: parseFloat(encodeFps),
+        elapsedMs: elapsed(), estimatedTotalMs,
+      });
       await yieldToUI();
     }
   }
 
   await videoEncoder.flush();
   videoEncoder.close();
-  console.log('[Export] Video encoding complete');
+
+  // ── Step 4: Finalize container ──
+  onStatus({ phase: 'Finalizing video', detail: 'Building MP4 container…', step: 4, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
+  onProgress(72);
 
   muxer.finalize();
   const videoOnlyBuf = (muxer.target as ArrayBufferTarget).buffer;
   const videoOnlyBlob = new Blob([videoOnlyBuf], { type: 'video/mp4' });
-  console.log('[Export] Video-only MP4:', (videoOnlyBuf.byteLength / 1024 / 1024).toFixed(2), 'MB');
+  const videoSizeMB = (videoOnlyBuf.byteLength / 1024 / 1024).toFixed(1);
+
+  onStatus({ phase: 'Finalizing video', detail: `Video track ready — ${videoSizeMB} MB`, step: 4, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
+  onProgress(75);
 
   let finalBlob = videoOnlyBlob;
 
+  // ── Step 5: Mux audio ──
   if (renderedAudio) {
-    onProgress(75);
-    console.log('[Export] Adding AAC audio via ffmpeg.wasm...');
+    onStatus({ phase: 'Adding audio', detail: 'Encoding AAC audio via FFmpeg…', step: 5, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
     const withAudio = await muxVideoWithAAC(
       videoOnlyBlob, renderedAudio, audioBitrate,
-      (r) => onProgress(75 + Math.round(r * 20)),
+      (r) => {
+        onProgress(75 + Math.round(r * 20));
+        onStatus({ phase: 'Adding audio', detail: `Muxing audio… ${Math.round(r * 100)}%`, step: 5, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
+      },
     );
     if (withAudio) {
       finalBlob = withAudio;
     } else {
-      console.warn('[Export] ffmpeg.wasm failed — exporting video-only MP4');
+      onStatus({ phase: 'Adding audio', detail: 'Audio mux failed — exporting video only', step: 5, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
     }
+  } else {
+    onStatus({ phase: 'Adding audio', detail: 'No audio to include', step: 5, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
   }
 
   videoEls.forEach((el) => { el.pause(); el.removeAttribute('src'); el.load(); });
 
+  const finalSizeMB = (finalBlob.size / 1024 / 1024).toFixed(1);
+  const totalSec = (elapsed() / 1000).toFixed(1);
+  onStatus({ phase: 'Complete', detail: `${finalSizeMB} MB in ${totalSec}s`, step: TOTAL_STEPS, totalSteps: TOTAL_STEPS, elapsedMs: elapsed() });
   onProgress(100);
+
   const filename = `export_${Date.now()}.mp4`;
-  console.log('[Export] Done:', (finalBlob.size / 1024 / 1024).toFixed(2), 'MB');
   onComplete(finalBlob, filename);
 }
 
 // PATH B: MediaRecorder WebM → ffmpeg.wasm MP4
 async function exportMP4ViaWebM(
   data: ExportData,
-  { onProgress, onComplete, onError }: ExportCallbacks,
+  { onProgress, onStatus, onComplete, onError }: ExportCallbacks,
 ) {
-  console.log('[Export] MP4 via WebM capture + ffmpeg.wasm conversion');
   const audioBitrate = AUDIO_BITRATE_MAP[data.settings.quality];
+  const totalDuration = computeTotalDuration(data);
+  const exportStart = performance.now();
+  const elapsed = () => performance.now() - exportStart;
 
-  const webmBlob = await captureWebM(data, (p) => onProgress(Math.round(p * 50)));
+  onStatus({ phase: 'Recording timeline', detail: 'Real-time capture starting…', step: 1, totalSteps: 3, elapsedMs: elapsed() });
+
+  const webmBlob = await captureWebM(data, (p) => {
+    const sec = (p * totalDuration).toFixed(1);
+    onProgress(Math.round(p * 50));
+    onStatus({ phase: 'Recording timeline', detail: `Captured ${sec}s / ${totalDuration.toFixed(1)}s`, step: 1, totalSteps: 3, elapsedMs: elapsed() });
+  });
   if (!webmBlob) { onError('WebM capture failed'); return; }
 
-  console.log('[Export] WebM captured:', (webmBlob.size / 1024 / 1024).toFixed(2), 'MB');
+  const webmMB = (webmBlob.size / 1024 / 1024).toFixed(1);
+  onStatus({ phase: 'Converting to MP4', detail: `WebM captured (${webmMB} MB), converting…`, step: 2, totalSteps: 3, elapsedMs: elapsed() });
   onProgress(55);
 
   const mp4Blob = await convertWebMToMP4(
     webmBlob, audioBitrate,
-    (r) => onProgress(55 + Math.round(r * 40)),
+    (r) => {
+      onProgress(55 + Math.round(r * 40));
+      onStatus({ phase: 'Converting to MP4', detail: `FFmpeg converting… ${Math.round(r * 100)}%`, step: 2, totalSteps: 3, elapsedMs: elapsed() });
+    },
   );
 
-  if (mp4Blob) {
-    onProgress(100);
-    onComplete(mp4Blob, `export_${Date.now()}.mp4`);
-  } else {
-    onProgress(100);
-    onComplete(webmBlob, `export_${Date.now()}.webm`);
-  }
+  const finalBlob = mp4Blob || webmBlob;
+  const ext = mp4Blob ? 'mp4' : 'webm';
+  const sizeMB = (finalBlob.size / 1024 / 1024).toFixed(1);
+  const totalSec = (elapsed() / 1000).toFixed(1);
+
+  onStatus({ phase: 'Complete', detail: `${sizeMB} MB in ${totalSec}s`, step: 3, totalSteps: 3, elapsedMs: elapsed() });
+  onProgress(100);
+  onComplete(finalBlob, `export_${Date.now()}.${ext}`);
 }
 
 // PATH C: Direct WebM
 async function exportWebM(
   data: ExportData,
-  { onProgress, onComplete, onError }: ExportCallbacks,
+  { onProgress, onStatus, onComplete, onError }: ExportCallbacks,
 ) {
-  const webmBlob = await captureWebM(data, (p) => onProgress(Math.round(p * 100)));
+  const totalDuration = computeTotalDuration(data);
+  const exportStart = performance.now();
+  const elapsed = () => performance.now() - exportStart;
+
+  onStatus({ phase: 'Recording WebM', detail: 'Real-time capture starting…', step: 1, totalSteps: 2, elapsedMs: elapsed() });
+
+  const webmBlob = await captureWebM(data, (p) => {
+    const sec = (p * totalDuration).toFixed(1);
+    onProgress(Math.round(p * 100));
+    onStatus({ phase: 'Recording WebM', detail: `Captured ${sec}s / ${totalDuration.toFixed(1)}s`, step: 1, totalSteps: 2, elapsedMs: elapsed() });
+  });
   if (!webmBlob) { onError('Export failed'); return; }
+
+  const sizeMB = (webmBlob.size / 1024 / 1024).toFixed(1);
+  const totalSec = (elapsed() / 1000).toFixed(1);
+  onStatus({ phase: 'Complete', detail: `${sizeMB} MB in ${totalSec}s`, step: 2, totalSteps: 2, elapsedMs: elapsed() });
   onProgress(100);
   onComplete(webmBlob, `export_${Date.now()}.webm`);
 }
@@ -676,13 +812,27 @@ function drawFit(ctx: CanvasRenderingContext2D, source: HTMLVideoElement | HTMLI
   ctx.drawImage(source, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
 }
 
-function seekVideo(video: HTMLVideoElement, time: number): Promise<void> {
+function seekVideoFull(video: HTMLVideoElement, time: number): Promise<void> {
   return new Promise((resolve) => {
     if (Math.abs(video.currentTime - time) < 0.02) { resolve(); return; }
-    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); resolve(); };
+    const onSeeked = () => { video.removeEventListener('seeked', onSeeked); clearTimeout(t); resolve(); };
     video.addEventListener('seeked', onSeeked);
     video.currentTime = time;
-    setTimeout(resolve, 500);
+    const t = setTimeout(resolve, 80);
+  });
+}
+
+function seekVideoFast(video: HTMLVideoElement, time: number) {
+  video.currentTime = time;
+}
+
+function waitForEncoderDrain(encoder: VideoEncoder, target: number): Promise<void> {
+  return new Promise((resolve) => {
+    const check = () => {
+      if (encoder.encodeQueueSize <= target) resolve();
+      else setTimeout(check, 1);
+    };
+    check();
   });
 }
 

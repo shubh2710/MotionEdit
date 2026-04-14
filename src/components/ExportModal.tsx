@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { ExportSettings } from '../utils/types';
-import { browserExportVideo, downloadBlob } from '../utils/browserExport';
+import { browserExportVideo, downloadBlob, ExportStatus } from '../utils/browserExport';
+import { getExportLockState, WakeLockState } from '../utils/exportWakeLock';
 
 interface ExportModalProps {
   onClose: () => void;
@@ -11,6 +12,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
   const { clips, tracks, textOverlays, imageOverlays, transitions, exportSettings, setExportSettings, isExporting, exportProgress } = useEditorStore();
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [exportStatus, setExportStatus] = useState<ExportStatus | null>(null);
+  const [lockState, setLockState] = useState<WakeLockState | null>(null);
+
+  useEffect(() => {
+    if (!isExporting) { setLockState(null); return; }
+    const id = setInterval(() => setLockState(getExportLockState()), 2000);
+    return () => clearInterval(id);
+  }, [isExporting]);
 
   const isBrowser = !window.electronAPI;
   const hasWebCodecs = typeof VideoEncoder !== 'undefined' && typeof AudioEncoder !== 'undefined';
@@ -21,6 +30,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
     if (!canExport) return;
     setExportError(null);
     setStatusMessage(null);
+    setExportStatus(null);
 
     if (window.electronAPI) {
       const path = await window.electronAPI.saveFile(`output.${exportSettings.format}`);
@@ -58,23 +68,21 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
         }, {
           onProgress: (percent) => {
             useEditorStore.getState().setExportProgress(percent);
-            if (percent > 0 && percent < 100) {
-              const isConverting = !hasWebCodecs && percent >= 55;
-              setStatusMessage(
-                isConverting
-                  ? `Converting to MP4 (H.264+AAC)... ${percent}% — this may take a few minutes`
-                  : `Rendering... ${percent}%`
-              );
-            }
+          },
+          onStatus: (status) => {
+            setExportStatus(status);
+            setStatusMessage(status.detail);
           },
           onComplete: (blob, filename) => {
             downloadBlob(blob, filename);
             setStatusMessage(`Export complete! File "${filename}" downloaded (${formatBlobSize(blob.size)})`);
+            setExportStatus((prev) => prev ? { ...prev, phase: 'Complete' } : null);
             useEditorStore.getState().setIsExporting(false);
             useEditorStore.getState().setExportProgress(100);
           },
           onError: (error) => {
             setExportError(error);
+            setExportStatus(null);
             useEditorStore.getState().setIsExporting(false);
           },
         });
@@ -85,19 +93,15 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
     }
   };
 
-  const estimatedTime = clips.length > 0
-    ? Math.max(...clips.map((c) => c.offset + (c.end - c.start) / c.speed))
-    : 0;
-
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={isExporting ? undefined : onClose}>
       <div
         className="bg-gray-900 border border-gray-700 rounded-xl shadow-2xl w-[440px] max-h-[80vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-gray-800">
           <h3 className="text-lg font-semibold">Export Video</h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">
+          <button onClick={onClose} disabled={isExporting} className="text-gray-400 hover:text-white transition-colors disabled:opacity-30 disabled:cursor-not-allowed">
             <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
               <path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z" />
             </svg>
@@ -207,21 +211,76 @@ export const ExportModal: React.FC<ExportModalProps> = ({ onClose }) => {
 
           {/* Progress */}
           {isExporting && (
-            <div>
-              <div className="flex justify-between text-sm text-gray-400 mb-1">
-                <span>{statusMessage || 'Exporting...'}</span>
-                <span>{exportProgress}%</span>
+            <div className="space-y-3">
+              {/* Step indicator */}
+              {exportStatus && (
+                <div className="flex items-center gap-2">
+                  {Array.from({ length: exportStatus.totalSteps }, (_, i) => {
+                    const stepNum = i + 1;
+                    const isDone = stepNum < exportStatus.step;
+                    const isActive = stepNum === exportStatus.step;
+                    return (
+                      <div key={i} className="flex items-center gap-1.5">
+                        <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0
+                          ${isDone ? 'bg-green-600 text-white' : isActive ? 'bg-blue-500 text-white animate-pulse' : 'bg-gray-700 text-gray-500'}`}>
+                          {isDone ? '✓' : stepNum}
+                        </div>
+                        {i < exportStatus.totalSteps - 1 && (
+                          <div className={`h-0.5 w-4 rounded ${isDone ? 'bg-green-600' : 'bg-gray-700'}`} />
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* Phase & detail */}
+              <div>
+                <div className="flex justify-between items-baseline mb-1">
+                  <span className="text-sm font-medium text-blue-400">{exportStatus?.phase || 'Exporting…'}</span>
+                  <span className="text-xs font-mono text-gray-400">{exportProgress}%</span>
+                </div>
+                <p className="text-xs text-gray-500">{exportStatus?.detail || statusMessage || 'Preparing…'}</p>
               </div>
-              <div className="h-2.5 bg-gray-800 rounded-full overflow-hidden">
+
+              {/* Progress bar */}
+              <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
                 <div
-                  className="h-full bg-blue-500 rounded-full transition-all duration-200"
+                  className="h-full bg-gradient-to-r from-blue-600 to-blue-400 rounded-full transition-all duration-300"
                   style={{ width: `${exportProgress}%` }}
                 />
               </div>
-              {isBrowser && !hasWebCodecs && exportProgress > 0 && exportProgress < 100 && (
-                <p className="text-[10px] text-gray-500 mt-1">
-                  ~{Math.ceil(estimatedTime * (1 - exportProgress / 100))}s remaining (real-time render)
-                </p>
+
+              {/* Frame counter + timing row */}
+              {exportStatus && (
+                <div className="flex justify-between text-[11px] text-gray-500 font-mono">
+                  <span>
+                    {exportStatus.currentFrame != null && exportStatus.totalFrames != null
+                      ? `Frame ${exportStatus.currentFrame} / ${exportStatus.totalFrames}`
+                      : `Step ${exportStatus.step} / ${exportStatus.totalSteps}`}
+                  </span>
+                  <span>
+                    {formatMs(exportStatus.elapsedMs)} elapsed
+                    {exportStatus.estimatedTotalMs != null && exportStatus.estimatedTotalMs > exportStatus.elapsedMs && (
+                      <> · ~{formatMs(exportStatus.estimatedTotalMs - exportStatus.elapsedMs)} left</>
+                    )}
+                  </span>
+                </div>
+              )}
+
+              {/* Sleep protection status */}
+              {lockState && (
+                <div className="bg-gray-800/60 rounded-lg px-3 py-2 space-y-1.5">
+                  <p className="text-[11px] font-medium text-gray-400">Sleep Protection Active</p>
+                  <div className="flex flex-wrap gap-x-3 gap-y-1">
+                    <LockBadge active={lockState.screenLock} label="Screen wake lock" />
+                    <LockBadge active={lockState.audioLock} label="Tab keepalive" />
+                    <LockBadge active={lockState.unloadGuard} label="Close guard" />
+                  </div>
+                  <p className="text-[10px] text-gray-600 leading-tight">
+                    Keep this tab visible for best performance. Progress is shown in the tab title if you switch tabs.
+                  </p>
+                </div>
               )}
             </div>
           )}
@@ -285,6 +344,21 @@ function formatBlobSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const LockBadge: React.FC<{ active: boolean; label: string }> = ({ active, label }) => (
+  <span className={`inline-flex items-center gap-1 text-[10px] ${active ? 'text-green-400' : 'text-yellow-500'}`}>
+    <span className={`w-1.5 h-1.5 rounded-full ${active ? 'bg-green-400' : 'bg-yellow-500'}`} />
+    {label}
+  </span>
+);
+
+function formatMs(ms: number): string {
+  const totalSec = Math.round(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}m ${s.toString().padStart(2, '0')}s`;
 }
 
 function buildFFmpegCommands(clips: any[], settings: ExportSettings, outputPath: string): string[] {
