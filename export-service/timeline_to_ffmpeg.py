@@ -4,6 +4,7 @@ Supports clips, transitions, text overlays, image overlays, speed changes,
 audio mixing, and hardware-accelerated encoding.
 """
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -54,6 +55,21 @@ def _clip_duration(clip: dict) -> float:
     return (clip["end"] - clip["start"]) / clip.get("speed", 1.0)
 
 
+def _has_audio_stream(file_path: str, ffmpeg_path: str = "ffmpeg") -> bool:
+    """Check if a media file contains an audio stream."""
+    ffprobe = ffmpeg_path.replace("ffmpeg", "ffprobe")
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "a", file_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        data = json.loads(result.stdout)
+        return len(data.get("streams", [])) > 0
+    except Exception:
+        return True  # assume audio exists if probing fails
+
+
 def build_ffmpeg_command(
     timeline: dict,
     file_map: dict[str, str],
@@ -88,9 +104,10 @@ def build_ffmpeg_command(
     if total_duration <= 0:
         raise ValueError("Timeline is empty")
 
-    # --- Build inputs (force constant frame rate on each input) ---
+    # --- Build inputs and probe for audio ---
     input_args: list[str] = []
     input_index_map: dict[str, int] = {}
+    input_has_audio: dict[int, bool] = {}
     input_counter = 0
 
     source_paths = set()
@@ -102,8 +119,9 @@ def build_ffmpeg_command(
             source_paths.add(sp)
             local_path = _resolve_path(sp, file_map)
             if local_path:
-                input_args.extend(["-r", str(fps), "-i", local_path])
+                input_args.extend(["-i", local_path])
                 input_index_map[sp] = input_counter
+                input_has_audio[input_counter] = _has_audio_stream(local_path, ffmpeg_path)
                 input_counter += 1
 
     for io in image_overlays:
@@ -114,6 +132,7 @@ def build_ffmpeg_command(
             if local_path:
                 input_args.extend(["-i", local_path])
                 input_index_map[src] = input_counter
+                input_has_audio[input_counter] = False
                 input_counter += 1
 
     if input_counter == 0:
@@ -355,6 +374,8 @@ def build_ffmpeg_command(
         sp = c.get("sourcePath", "") or c.get("sourceName", "")
         idx = input_index_map.get(sp)
         if idx is None:
+            continue
+        if not input_has_audio.get(idx, False):
             continue
 
         track_idx = c.get("track", 0)
