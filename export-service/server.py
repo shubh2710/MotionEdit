@@ -102,13 +102,20 @@ async def stage_files(files: list[UploadFile] = File(...)):
 
 
 @app.post("/stage/check")
-async def check_staged(filenames: list[str]):
-    """Check which files already exist in the staging directory."""
+async def check_staged(file_sizes: dict[str, int]):
+    """Check which files already exist with matching sizes in the staging directory."""
     result: dict[str, bool] = {}
-    for name in filenames:
+    for name, expected_size in file_sizes.items():
         safe_name = name.replace("/", "_").replace("\\", "_")
         dest = STAGE_DIR / safe_name
-        result[name] = dest.exists()
+        if dest.exists():
+            actual_size = dest.stat().st_size
+            matches = actual_size == expected_size
+            if not matches:
+                print(f"  [stage] {safe_name}: size mismatch (staged={actual_size}, new={expected_size}), will re-upload")
+            result[name] = matches
+        else:
+            result[name] = False
     return result
 
 
