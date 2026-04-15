@@ -384,24 +384,27 @@ def build_ffmpeg_command(
                 current_video = merged
 
     # Step 3: Image overlays
+    # Editor uses 0-1 fractions for x/y/width/height, centered around (x,y)
     for io in image_overlays:
         src = io.get("src", "") or io.get("name", "")
         idx = input_index_map.get(src)
         if idx is None:
+            print(f"  [WARN] Image overlay src='{src}' not found in inputs, skipping")
             continue
 
-        x_pct = io.get("x", 0)
-        y_pct = io.get("y", 0)
-        w_pct = io.get("width", 10)
-        h_pct = io.get("height", 10)
+        x_frac = io.get("x", 0)
+        y_frac = io.get("y", 0)
+        w_frac = io.get("width", 0.1)
+        h_frac = io.get("height", 0.1)
         opacity = io.get("opacity", 1.0)
         start_t = io.get("startTime", 0)
         end_t = io.get("endTime", total_duration)
 
-        ow = max(1, int(w * w_pct / 100))
-        oh = max(1, int(h * h_pct / 100))
-        ox = int(w * x_pct / 100)
-        oy = int(h * y_pct / 100)
+        ow = max(1, int(w * w_frac))
+        oh = max(1, int(h * h_frac))
+        # Center the overlay around (x, y) like the editor does
+        ox = int(w * x_frac - ow / 2)
+        oy = int(h * y_frac - oh / 2)
 
         img_lbl = next_label("img")
         alpha_filter = f",colorchannelmixer=aa={opacity:.2f}" if opacity < 0.99 else ""
@@ -415,16 +418,18 @@ def build_ffmpeg_command(
             f"[{current_video}][{img_lbl}]overlay={ox}:{oy}:enable='{enable}'[{merged}]"
         )
         current_video = merged
+        print(f"  [OK] Image overlay src='{src}' at ({ox},{oy}) size={ow}x{oh} t={start_t:.1f}-{end_t:.1f}s")
 
     # Step 4: Text overlays via drawtext
+    # Editor uses 0-1 fractions for x/y, text is centered at that point
     for to in text_overlays:
         text = to.get("text", "").replace("'", "'\\''").replace(":", "\\:")
         if not text:
             continue
 
         style = to.get("style", {})
-        x_pct = to.get("x", 50)
-        y_pct = to.get("y", 50)
+        x_frac = to.get("x", 0.5)
+        y_frac = to.get("y", 0.5)
         start_t = to.get("startTime", 0)
         end_t = to.get("endTime", total_duration)
         font_size = style.get("fontSize", 48)
@@ -433,8 +438,9 @@ def build_ffmpeg_command(
         bold = style.get("bold", False)
 
         scaled_size = int(font_size * (h / 1080))
-        x_pos = f"w*{x_pct / 100:.4f}-tw/2"
-        y_pos = f"h*{y_pct / 100:.4f}-th/2"
+        # x/y are 0-1 fractions; center text at that position
+        x_pos = f"w*{x_frac:.4f}-tw/2"
+        y_pos = f"h*{y_frac:.4f}-th/2"
 
         stroke_w = style.get("strokeWidth", 0)
         stroke_c = style.get("strokeColor", "#000000")
