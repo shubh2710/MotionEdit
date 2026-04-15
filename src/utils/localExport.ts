@@ -80,54 +80,21 @@ export async function exportViaLocalService(
     pathToFileName[io.src] = fileName;
   }
 
-  onStatus({ phase: 'Checking files', detail: `Fetching ${allSources.length} file(s)…`, step: 1, totalSteps: 4, elapsedMs: elapsed() });
+  onStatus({ phase: 'Collecting files', detail: `Fetching ${allSources.length} file(s) fresh…`, step: 1, totalSteps: 4, elapsedMs: elapsed() });
 
-  // Fetch all blobs first so we know their sizes
-  const blobMap: Record<string, Blob> = {};
+  // Fetch all blobs fresh — no caching, always use latest content
+  const formData = new FormData();
   for (const source of allSources) {
     try {
       const response = await fetch(source.path);
-      blobMap[source.fileName] = await response.blob();
+      const blob = await response.blob();
+      formData.append('files', blob, source.fileName);
     } catch (err) {
       console.warn('[LocalExport] Failed to fetch source:', source.path, err);
     }
   }
 
-  // Check which files are already staged with matching sizes
-  let alreadyStaged: Record<string, boolean> = {};
-  try {
-    const sizeMap: Record<string, number> = {};
-    for (const source of allSources) {
-      const blob = blobMap[source.fileName];
-      if (blob) sizeMap[source.fileName] = blob.size;
-    }
-    const checkRes = await fetch(`${SERVICE_URL}/stage/check`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(sizeMap),
-    });
-    if (checkRes.ok) alreadyStaged = await checkRes.json();
-  } catch { /* server doesn't support check, upload all */ }
-
-  // Only upload files that aren't already staged or have different sizes
-  const toUpload = allSources.filter((s) => !alreadyStaged[s.fileName]);
-
-  if (toUpload.length > 0) {
-    onStatus({ phase: 'Staging', detail: `Copying ${toUpload.length} file(s) to local service…`, step: 1, totalSteps: 4, elapsedMs: elapsed() });
-
-    const stageForm = new FormData();
-    for (const source of toUpload) {
-      const blob = blobMap[source.fileName];
-      if (blob) stageForm.append('files', blob, source.fileName);
-    }
-
-    await fetch(`${SERVICE_URL}/stage`, { method: 'POST', body: stageForm });
-  } else {
-    onStatus({ phase: 'Staging', detail: 'All files already on local service', step: 1, totalSteps: 4, elapsedMs: elapsed() });
-  }
-
-  // Build the export request — only timeline JSON, no file uploads needed
-  const formData = new FormData();
+  onStatus({ phase: 'Uploading', detail: `Sending ${allSources.length} file(s) to local service…`, step: 1, totalSteps: 4, elapsedMs: elapsed() });
 
   const rewrittenClips = data.clips.map((c) => ({
     ...c,

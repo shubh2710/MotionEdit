@@ -33,8 +33,6 @@ app.add_middleware(
 JOBS: dict[str, dict] = {}
 TEMP_ROOT = Path(tempfile.gettempdir()) / "video-export-service"
 TEMP_ROOT.mkdir(exist_ok=True)
-STAGE_DIR = TEMP_ROOT / "staged-media"
-STAGE_DIR.mkdir(exist_ok=True)
 
 ENCODER = "libx264"
 FFMPEG_PATH = "ffmpeg"
@@ -71,6 +69,11 @@ async def startup():
         print(f"[INFO] FFmpeg found: {FFMPEG_PATH}")
         print(f"[INFO] Selected encoder: {ENCODER}")
 
+    old_stage = TEMP_ROOT / "staged-media"
+    if old_stage.exists():
+        shutil.rmtree(old_stage, ignore_errors=True)
+        print("[INFO] Cleaned up old staged-media cache")
+
 
 @app.get("/health")
 async def health():
@@ -81,42 +84,6 @@ async def health():
         "ffmpeg": FFMPEG_PATH,
         "ffmpeg_available": ffmpeg_ok,
     }
-
-
-@app.post("/stage")
-async def stage_files(files: list[UploadFile] = File(...)):
-    """Upload files to a persistent staging directory. Skips files that already exist with the same size."""
-    staged = []
-    for f in files:
-        safe_name = f.filename.replace("/", "_").replace("\\", "_")
-        dest = STAGE_DIR / safe_name
-        content = await f.read()
-        if dest.exists() and dest.stat().st_size == len(content):
-            staged.append({"name": safe_name, "status": "exists", "path": str(dest)})
-        else:
-            with open(dest, "wb") as out:
-                out.write(content)
-            staged.append({"name": safe_name, "status": "uploaded", "path": str(dest)})
-    print(f"[stage] Staged {len(staged)} file(s): {[s['name'] for s in staged]}")
-    return {"files": staged}
-
-
-@app.post("/stage/check")
-async def check_staged(file_sizes: dict[str, int]):
-    """Check which files already exist with matching sizes in the staging directory."""
-    result: dict[str, bool] = {}
-    for name, expected_size in file_sizes.items():
-        safe_name = name.replace("/", "_").replace("\\", "_")
-        dest = STAGE_DIR / safe_name
-        if dest.exists():
-            actual_size = dest.stat().st_size
-            matches = actual_size == expected_size
-            if not matches:
-                print(f"  [stage] {safe_name}: size mismatch (staged={actual_size}, new={expected_size}), will re-upload")
-            result[name] = matches
-        else:
-            result[name] = False
-    return result
 
 
 @app.post("/export")
@@ -135,22 +102,17 @@ async def start_export(
         raise HTTPException(400, f"Invalid timeline JSON: {e}")
 
     file_map: dict[str, str] = {}
+    media_dir = job_dir / "media"
+    media_dir.mkdir(exist_ok=True)
 
-    # First, include any files uploaded with this request (fallback / small files)
     for f in files:
         safe_name = f.filename.replace("/", "_").replace("\\", "_")
-        dest = STAGE_DIR / safe_name
+        dest = media_dir / safe_name
         content = await f.read()
-        if not dest.exists() or dest.stat().st_size != len(content):
-            with open(dest, "wb") as out:
-                out.write(content)
+        with open(dest, "wb") as out:
+            out.write(content)
         file_map[f.filename] = str(dest)
         file_map[safe_name] = str(dest)
-
-    # Then, add all staged files to the map (so timeline can reference them)
-    for staged_file in STAGE_DIR.iterdir():
-        if staged_file.is_file():
-            file_map[staged_file.name] = str(staged_file)
 
     print(f"[{job_id}] Available files ({len(set(file_map.values()))}): {list(set(file_map.values()))}")
     for c in timeline_data.get("clips", []):
