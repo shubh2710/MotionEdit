@@ -120,6 +120,8 @@ const MediaItem: React.FC<{
   onRemove: () => void;
 }> = ({ file, isActive, onSelect, onRemove }) => {
   const addClipToTimeline = useEditorStore((s) => s.addClipToTimeline);
+  const addImageOverlay = useEditorStore((s) => s.addImageOverlay);
+  const selectOverlay = useEditorStore((s) => s.selectOverlay);
   const clips = useEditorStore((s) => s.clips);
 
   const handleDragStart = (e: React.DragEvent) => {
@@ -154,6 +156,12 @@ const MediaItem: React.FC<{
     });
   };
 
+  const handleAddAsOverlay = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const id = addImageOverlay(file.path, file.name, file.file);
+    selectOverlay(id, 'image');
+  };
+
   const typeColor = file.type === 'video' ? 'text-blue-400' : file.type === 'audio' ? 'text-green-400' : 'text-purple-400';
 
   return (
@@ -168,6 +176,8 @@ const MediaItem: React.FC<{
       <div className="aspect-video bg-gray-800 flex items-center justify-center relative">
         {file.thumbnail ? (
           <img src={file.thumbnail} alt={file.name} className="w-full h-full object-cover" />
+        ) : file.type === 'image' ? (
+          <img src={file.path} alt={file.name} className="w-full h-full object-cover" />
         ) : (
           <span className={typeColor}>
             {file.type === 'video' ? <VideoIcon /> : file.type === 'audio' ? <AudioIcon /> : <ImageIcon />}
@@ -187,6 +197,15 @@ const MediaItem: React.FC<{
             {file.type}
           </span>
         </div>
+        {file.type === 'image' && (
+          <button
+            onClick={handleAddAsOverlay}
+            title="Add as overlay"
+            className="absolute bottom-1 left-1 px-1.5 py-0.5 bg-pink-600/80 hover:bg-pink-500 text-[9px] text-white font-medium rounded opacity-0 group-hover:opacity-100 transition-opacity"
+          >
+            + Overlay
+          </button>
+        )}
         <button
           onClick={(e) => { e.stopPropagation(); onRemove(); }}
           className="absolute top-1 right-1 w-5 h-5 bg-black/70 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-600"

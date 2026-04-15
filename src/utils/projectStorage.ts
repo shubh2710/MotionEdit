@@ -288,6 +288,9 @@ export function getUsedAssetIds(data: Pick<ProjectData, 'clips' | 'imageOverlays
   for (const c of data.clips) {
     if (c.sourceId && c.type !== 'blank') ids.add(c.sourceId);
   }
+  for (const io of data.imageOverlays) {
+    ids.add(io.id);
+  }
   return ids;
 }
 
