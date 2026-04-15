@@ -126,6 +126,7 @@ const MediaItem: React.FC<{
 
   const handleDragStart = (e: React.DragEvent) => {
     e.dataTransfer.setData('application/media-id', file.id);
+    e.dataTransfer.setData('application/media-type', file.type);
     e.dataTransfer.effectAllowed = 'copy';
   };
 

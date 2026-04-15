@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { ExportModal } from './ExportModal';
 import { BlankClipModal } from './BlankClipModal';
@@ -9,7 +9,7 @@ export const Toolbar: React.FC = () => {
   const {
     selectedClipIds, splitAtPlayhead, removeSelectedClips, undo, redo,
     zoom, setZoom, clips, currentTime,
-    addTextOverlay, addImageOverlay, selectOverlay,
+    addTextOverlay, selectOverlay,
     projectName, isDirty, isSaving, setShowDashboard, newProject,
     saveCurrentProject, projectId,
   } = useEditorStore();
@@ -18,7 +18,6 @@ export const Toolbar: React.FC = () => {
   const [showBlankClip, setShowBlankClip] = useState(false);
   const [showTransition, setShowTransition] = useState(false);
   const [showSave, setShowSave] = useState<'save' | 'saveAs' | null>(null);
-  const imageInputRef = useRef<HTMLInputElement>(null);
 
   const hasSelection = selectedClipIds.length > 0;
   const hasClipUnderPlayhead = clips.some((c) => {
@@ -29,23 +28,6 @@ export const Toolbar: React.FC = () => {
   const handleAddText = () => {
     const id = addTextOverlay();
     selectOverlay(id, 'text');
-  };
-
-  const handleAddImage = () => {
-    imageInputRef.current?.click();
-  };
-
-  const handleImageFile = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files) return;
-    for (const file of Array.from(files)) {
-      if (file.type.startsWith('image/')) {
-        const url = URL.createObjectURL(file);
-        const id = addImageOverlay(url, file.name, file);
-        selectOverlay(id, 'image');
-      }
-    }
-    e.target.value = '';
   };
 
   const handleQuickSave = async () => {
@@ -89,11 +71,8 @@ export const Toolbar: React.FC = () => {
           <Divider />
 
           <ToolButtonLabeled icon={<TextIcon />} label="Text" onClick={handleAddText} accent="amber" />
-          <ToolButtonLabeled icon={<ImageIcon />} label="Image" onClick={handleAddImage} accent="pink" />
           <ToolButtonLabeled icon={<BlankIcon />} label="Blank" onClick={() => setShowBlankClip(true)} accent="gray" />
           <ToolButtonLabeled icon={<TransitionIcon />} label="Transition" onClick={() => setShowTransition(true)} accent="yellow" />
-
-          <input ref={imageInputRef} type="file" accept="image/*" multiple className="hidden" onChange={handleImageFile} />
         </div>
 
         <div className="flex items-center gap-3">
@@ -226,11 +205,6 @@ const DeleteIcon = () => (
 const TextIcon = () => (
   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 6v2m16-2v2M7 6v12m5-12v12m5-12v12M7 18h10" />
-  </svg>
-);
-const ImageIcon = () => (
-  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
   </svg>
 );
 const BlankIcon = () => (

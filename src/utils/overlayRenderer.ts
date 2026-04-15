@@ -2,6 +2,25 @@ import { TextOverlay, ImageOverlay, Transition, Clip, TextAnimation } from './ty
 
 const imageCache = new Map<string, HTMLImageElement>();
 
+let gifContainer: HTMLDivElement | null = null;
+
+function getGifContainer(): HTMLDivElement {
+  if (!gifContainer) {
+    gifContainer = document.createElement('div');
+    gifContainer.style.cssText = 'position:fixed;top:-9999px;left:-9999px;width:1px;height:1px;overflow:hidden;pointer-events:none;opacity:0.01;';
+    gifContainer.setAttribute('aria-hidden', 'true');
+    document.body.appendChild(gifContainer);
+  }
+  return gifContainer;
+}
+
+function isGifSource(src: string): boolean {
+  if (src.includes('.gif')) return true;
+  const img = imageCache.get(src);
+  if (img && img.src.includes('.gif')) return true;
+  return false;
+}
+
 export function loadImage(src: string): Promise<HTMLImageElement> {
   const cached = imageCache.get(src);
   if (cached?.complete) return Promise.resolve(cached);
@@ -11,6 +30,9 @@ export function loadImage(src: string): Promise<HTMLImageElement> {
     img.crossOrigin = 'anonymous';
     img.onload = () => {
       imageCache.set(src, img);
+      if (isGifSource(src)) {
+        getGifContainer().appendChild(img);
+      }
       resolve(img);
     };
     img.onerror = reject;

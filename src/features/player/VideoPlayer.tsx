@@ -392,20 +392,35 @@ export const VideoPlayer: React.FC = () => {
   const handleCanvasDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     const canvas = canvasRef.current;
-    const files = e.dataTransfer.files;
-    if (!files.length || !canvas) return;
+    if (!canvas) return;
+
     const rect = canvas.getBoundingClientRect();
     const dropX = (e.clientX - rect.left) / rect.width;
     const dropY = (e.clientY - rect.top) / rect.height;
+    const clampX = Math.max(0.1, Math.min(0.9, dropX));
+    const clampY = Math.max(0.1, Math.min(0.9, dropY));
+
+    const mediaId = e.dataTransfer.getData('application/media-id');
+    const mediaType = e.dataTransfer.getData('application/media-type');
+
+    if (mediaId && mediaType === 'image') {
+      const state = useEditorStore.getState();
+      const mf = state.mediaFiles.find((f) => f.id === mediaId);
+      if (mf) {
+        const id = state.addImageOverlay(mf.path, mf.name, mf.file);
+        state.updateImageOverlay(id, { x: clampX, y: clampY });
+      }
+      return;
+    }
+
+    const files = e.dataTransfer.files;
+    if (!files.length) return;
     for (const file of Array.from(files)) {
       if (file.type.startsWith('image/')) {
         const url = URL.createObjectURL(file);
         loadImage(url).then(() => {
           const id = useEditorStore.getState().addImageOverlay(url, file.name, file);
-          useEditorStore.getState().updateImageOverlay(id, {
-            x: Math.max(0.1, Math.min(0.9, dropX)),
-            y: Math.max(0.1, Math.min(0.9, dropY)),
-          });
+          useEditorStore.getState().updateImageOverlay(id, { x: clampX, y: clampY });
         }).catch(() => {});
       }
     }
