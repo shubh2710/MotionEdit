@@ -33,7 +33,9 @@ export const VideoPlayer: React.FC = () => {
   const dragStartRef = useRef<{ ox: number; oy: number; ow: number; oh: number; mx: number; my: number } | null>(null);
 
   const videoPoolRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const imagePoolRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const lastDrawnRef = useRef<ImageData | null>(null);
+  const sizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
 
   const {
     clips, tracks, currentTime, isPlaying, duration,
@@ -64,12 +66,24 @@ export const VideoPlayer: React.FC = () => {
     return el;
   }, []);
 
-  // Preload ALL clip video sources immediately
+  const getOrCreateImage = useCallback((src: string): HTMLImageElement => {
+    const pool = imagePoolRef.current;
+    let el = pool.get(src);
+    if (el) return el;
+
+    el = new Image();
+    el.src = src;
+    pool.set(src, el);
+    return el;
+  }, []);
+
+  // Preload ALL clip sources immediately
   useEffect(() => {
     for (const c of clips) {
       if (c.type === 'video' && c.sourcePath) getOrCreateVideo(c.sourcePath);
+      if (c.type === 'image' && c.sourcePath) getOrCreateImage(c.sourcePath);
     }
-  }, [clips, getOrCreateVideo]);
+  }, [clips, getOrCreateVideo, getOrCreateImage]);
 
   // Keep the active video element playing/paused in sync
   useEffect(() => {
@@ -99,18 +113,28 @@ export const VideoPlayer: React.FC = () => {
     const container = containerRef.current;
     if (!canvas || !container) return;
 
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const ctx = canvas.getContext('2d', { willReadFrequently: false });
     if (!ctx) return;
 
     let running = true;
+    let resizeRaf = 0;
+
+    const updateSize = () => {
+      const rect = container.getBoundingClientRect();
+      sizeRef.current = { w: rect.width, h: rect.height };
+    };
+    updateSize();
+    const resizeObs = new ResizeObserver(() => {
+      cancelAnimationFrame(resizeRaf);
+      resizeRaf = requestAnimationFrame(updateSize);
+    });
+    resizeObs.observe(container);
 
     const render = () => {
       if (!running) return;
 
-      const rect = container.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
-      const w = rect.width;
-      const h = rect.height;
+      const { w, h } = sizeRef.current;
 
       if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
         canvas.width = w * dpr;
@@ -189,9 +213,8 @@ export const VideoPlayer: React.FC = () => {
           renderBlankClip(ctx, currentClip, w, h);
           drewSomething = true;
         } else if (currentClip?.type === 'image') {
-          const img = new Image();
-          img.src = currentClip.sourcePath;
-          if (img.complete && img.naturalWidth > 0) {
+          const img = imagePoolRef.current.get(currentClip.sourcePath);
+          if (img && img.complete && img.naturalWidth > 0) {
             ctx.clearRect(0, 0, w, h);
             drawFit(ctx, img, w, h);
             drewSomething = true;
@@ -222,8 +245,12 @@ export const VideoPlayer: React.FC = () => {
           const activeMf = activeMid ? state.mediaFiles.find((f) => f.id === activeMid) : null;
           if (activeMf) {
             if (activeMf.type === 'image') {
-              const img = new Image();
-              img.src = activeMf.path;
+              let img = imagePoolRef.current.get(activeMf.path);
+              if (!img) {
+                img = new Image();
+                img.src = activeMf.path;
+                imagePoolRef.current.set(activeMf.path, img);
+              }
               if (img.complete && img.naturalWidth > 0) {
                 ctx.clearRect(0, 0, w, h);
                 drawFit(ctx, img, w, h);
@@ -284,7 +311,12 @@ export const VideoPlayer: React.FC = () => {
     };
 
     animFrameRef.current = requestAnimationFrame(render);
-    return () => { running = false; cancelAnimationFrame(animFrameRef.current); };
+    return () => {
+      running = false;
+      cancelAnimationFrame(animFrameRef.current);
+      cancelAnimationFrame(resizeRaf);
+      resizeObs.disconnect();
+    };
   }, [isDraggingOverlay, resizeMode, hasTimelineClips, hasOverlays]);
 
   // --- Mouse interaction ---
