@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
 import { useEditorStore } from '../../store/editorStore';
-import { formatTime, computeEffectiveVolume } from '../../utils/helpers';
+import { formatTime } from '../../utils/helpers';
 import {
   renderTextOverlay, renderImageOverlay, renderBlankClip,
   renderOverlayBoundingBox, renderSnapGuides, renderTransition,
@@ -24,6 +24,30 @@ function findVisualClipAt(clips: Clip[], tracks: { type: string }[], time: numbe
   return undefined;
 }
 
+const TimeDisplay: React.FC = React.memo(() => {
+  const currentTime = useEditorStore((s) => s.currentTime);
+  const duration = useEditorStore((s) => s.duration);
+  const [display, setDisplay] = useState({ ct: '0:00', dur: '0:00' });
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      const s = useEditorStore.getState();
+      setDisplay({ ct: formatTime(s.currentTime), dur: formatTime(s.duration) });
+    }, 100);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    setDisplay({ ct: formatTime(currentTime), dur: formatTime(duration) });
+  }, [currentTime > 0 ? Math.floor(currentTime * 10) : 0, duration]);
+
+  return (
+    <span className="text-xs text-gray-500 font-mono">
+      {display.ct} / {display.dur}
+    </span>
+  );
+});
+
 export const VideoPlayer: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -36,17 +60,25 @@ export const VideoPlayer: React.FC = () => {
   const imagePoolRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const lastDrawnRef = useRef<ImageData | null>(null);
   const sizeRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
+  const lastPlaySyncRef = useRef<string>('');
 
-  const {
-    clips, tracks, currentTime, isPlaying, duration,
-    setCurrentTime, setIsPlaying, activeMediaId, mediaFiles,
-    textOverlays, imageOverlays, transitions,
-    selectedOverlayId,
-    selectOverlay, clearSelection,
-    updateTextOverlay, updateImageOverlay,
-  } = useEditorStore();
+  const clips = useEditorStore((s) => s.clips);
+  const tracks = useEditorStore((s) => s.tracks);
+  const isPlaying = useEditorStore((s) => s.isPlaying);
+  const duration = useEditorStore((s) => s.duration);
+  const setCurrentTime = useEditorStore((s) => s.setCurrentTime);
+  const setIsPlaying = useEditorStore((s) => s.setIsPlaying);
+  const activeMediaId = useEditorStore((s) => s.activeMediaId);
+  const mediaFiles = useEditorStore((s) => s.mediaFiles);
+  const imageOverlays = useEditorStore((s) => s.imageOverlays);
+  const selectedOverlayId = useEditorStore((s) => s.selectedOverlayId);
+  const selectOverlay = useEditorStore((s) => s.selectOverlay);
+  const clearSelection = useEditorStore((s) => s.clearSelection);
+  const updateTextOverlay = useEditorStore((s) => s.updateTextOverlay);
+  const updateImageOverlay = useEditorStore((s) => s.updateImageOverlay);
 
   const hasTimelineClips = clips.length > 0;
+  const textOverlays = useEditorStore((s) => s.textOverlays);
   const hasOverlays = textOverlays.length > 0 || imageOverlays.length > 0;
 
   useEffect(() => { preloadOverlayImages(imageOverlays); }, [imageOverlays]);
@@ -85,29 +117,30 @@ export const VideoPlayer: React.FC = () => {
     }
   }, [clips, getOrCreateVideo, getOrCreateImage]);
 
-  // Keep the active video element playing/paused in sync
+  // Sync video play/pause state — only when isPlaying or clips change, NOT on currentTime
   useEffect(() => {
     const pool = videoPoolRef.current;
     const state = useEditorStore.getState();
+    const ct = state.currentTime;
+
     for (const c of state.clips) {
       if (c.type !== 'video' || !c.sourcePath) continue;
       const vid = pool.get(c.sourcePath);
       if (!vid) continue;
 
-      const ct = state.currentTime;
       const cEnd = clipEnd(c);
       const isActive = ct >= c.offset - FRAME_EPS && ct <= cEnd + FRAME_EPS;
 
       if (isActive && isPlaying) {
         vid.playbackRate = c.speed;
         if (vid.paused) vid.play().catch(() => {});
-      } else if (!isActive || !isPlaying) {
+      } else {
         if (!vid.paused) vid.pause();
       }
     }
-  }, [isPlaying, currentTime, clips, getOrCreateVideo]);
+  }, [isPlaying, clips]);
 
-  // Canvas render loop — the heart of gapless playback
+  // Single unified render + playback loop
   useEffect(() => {
     const canvas = canvasRef.current;
     const container = containerRef.current;
@@ -118,6 +151,7 @@ export const VideoPlayer: React.FC = () => {
 
     let running = true;
     let resizeRaf = 0;
+    let lastFrameTs = 0;
 
     const updateSize = () => {
       const rect = container.getBoundingClientRect();
@@ -130,8 +164,23 @@ export const VideoPlayer: React.FC = () => {
     });
     resizeObs.observe(container);
 
-    const render = () => {
+    const render = (now: number) => {
       if (!running) return;
+
+      const store = useEditorStore.getState();
+
+      // Advance time if playing (replaces separate usePlaybackEngine rAF)
+      if (store.isPlaying && lastFrameTs > 0) {
+        const delta = (now - lastFrameTs) / 1000;
+        const next = store.currentTime + delta;
+        if (store.duration > 0 && next >= store.duration) {
+          store.setCurrentTime(store.duration);
+          store.setIsPlaying(false);
+        } else {
+          store.setCurrentTime(next);
+        }
+      }
+      lastFrameTs = now;
 
       const dpr = window.devicePixelRatio || 1;
       const { w, h } = sizeRef.current;
@@ -150,25 +199,30 @@ export const VideoPlayer: React.FC = () => {
       const ct = state.currentTime;
       const pool = videoPoolRef.current;
 
-      // Pre-seek: for every video clip, sync the pool element to its correct source time.
-      // This is critical — doing it in the render loop (not a React effect) guarantees
-      // the seek happens BEFORE we try to draw, eliminating the 1-frame lag.
+      // Sync play/pause for videos near the playhead (lightweight, no React re-render)
       for (const c of state.clips) {
         if (c.type !== 'video' || !c.sourcePath) continue;
         const cEnd = clipEnd(c);
-        // Seek clips that are currently active OR about to become active (within 0.5s)
-        const isNearby = ct >= c.offset - 0.5 && ct <= cEnd + 0.1;
-        if (!isNearby) continue;
-
+        const isActive = ct >= c.offset - FRAME_EPS && ct <= cEnd + FRAME_EPS;
         const vid = pool.get(c.sourcePath);
         if (!vid) continue;
 
-        const srcTime = c.start + Math.max(0, ct - c.offset) * c.speed;
-        const clampedSrc = Math.min(srcTime, c.end);
-        if (Math.abs(vid.currentTime - clampedSrc) > 0.1) {
-          vid.currentTime = clampedSrc;
+        if (isActive && state.isPlaying) {
+          vid.playbackRate = c.speed;
+          if (vid.paused) vid.play().catch(() => {});
+        } else if (!isActive || !state.isPlaying) {
+          if (!vid.paused) vid.pause();
         }
-        vid.playbackRate = c.speed;
+
+        // Seek only when needed (not playing, or drift is significant)
+        if (isActive || (ct >= c.offset - 0.5 && ct <= cEnd + 0.1)) {
+          const srcTime = c.start + Math.max(0, ct - c.offset) * c.speed;
+          const clampedSrc = Math.min(srcTime, c.end);
+          const drift = Math.abs(vid.currentTime - clampedSrc);
+          if ((!state.isPlaying && drift > 0.05) || drift > 0.3) {
+            vid.currentTime = clampedSrc;
+          }
+        }
       }
 
       let drewSomething = false;
@@ -317,7 +371,7 @@ export const VideoPlayer: React.FC = () => {
       cancelAnimationFrame(resizeRaf);
       resizeObs.disconnect();
     };
-  }, [isDraggingOverlay, resizeMode, hasTimelineClips, hasOverlays]);
+  }, [isDraggingOverlay, resizeMode, hasTimelineClips, hasOverlays, isPlaying]);
 
   // --- Mouse interaction ---
   const handleCanvasMouseDown = useCallback((e: React.MouseEvent) => {
@@ -458,22 +512,27 @@ export const VideoPlayer: React.FC = () => {
     }
   }, []);
 
-  const activeClip = clips.find((c) =>
-    currentTime >= c.offset - FRAME_EPS && currentTime <= clipEnd(c) + FRAME_EPS,
-  );
   const activeMedia = activeMediaId ? mediaFiles.find((f) => f.id === activeMediaId) : null;
-  const previewSource = hasTimelineClips ? (activeClip?.sourcePath || null) : (activeMedia?.path || null);
-  const noClipMessage = hasTimelineClips && !activeClip && !hasOverlays ? 'No clip at current time' : null;
 
   const togglePlay = useCallback(() => {
-    if (duration === 0 && clips.length === 0 && !activeMedia) return;
-    setIsPlaying(!isPlaying);
-  }, [isPlaying, duration, clips.length, activeMedia, setIsPlaying]);
+    const s = useEditorStore.getState();
+    if (s.duration === 0 && s.clips.length === 0 && !activeMedia) return;
+    s.setIsPlaying(!s.isPlaying);
+  }, [activeMedia]);
 
-  const skipBack = useCallback(() => setCurrentTime(Math.max(0, currentTime - 5)), [currentTime, setCurrentTime]);
-  const skipForward = useCallback(() => setCurrentTime(currentTime + 5), [currentTime, setCurrentTime]);
-  const goToStart = useCallback(() => setCurrentTime(0), [setCurrentTime]);
-  const goToEnd = useCallback(() => { if (duration > 0) setCurrentTime(duration); }, [duration, setCurrentTime]);
+  const skipBack = useCallback(() => {
+    const s = useEditorStore.getState();
+    s.setCurrentTime(Math.max(0, s.currentTime - 5));
+  }, []);
+  const skipForward = useCallback(() => {
+    const s = useEditorStore.getState();
+    s.setCurrentTime(s.currentTime + 5);
+  }, []);
+  const goToStart = useCallback(() => useEditorStore.getState().setCurrentTime(0), []);
+  const goToEnd = useCallback(() => {
+    const s = useEditorStore.getState();
+    if (s.duration > 0) s.setCurrentTime(s.duration);
+  }, []);
 
   const cursorStyle = resizeMode
     ? (resizeMode === 'tl' || resizeMode === 'br' ? 'nwse-resize' : 'nesw-resize')
@@ -483,9 +542,7 @@ export const VideoPlayer: React.FC = () => {
     <div className="flex flex-col h-full bg-gray-950">
       <div className="flex items-center justify-between px-3 py-2 border-b border-gray-800">
         <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-400">Preview</h2>
-        <span className="text-xs text-gray-500 font-mono">
-          {formatTime(currentTime)} / {formatTime(duration)}
-        </span>
+        <TimeDisplay />
       </div>
 
       <div
@@ -501,7 +558,7 @@ export const VideoPlayer: React.FC = () => {
           style={{ cursor: cursorStyle }}
         />
 
-        {!previewSource && !hasOverlays && !noClipMessage && (
+        {!hasTimelineClips && !hasOverlays && !activeMedia && (
           <div className="text-center text-gray-600 z-10 pointer-events-none">
             <svg className="w-16 h-16 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
@@ -509,12 +566,6 @@ export const VideoPlayer: React.FC = () => {
             </svg>
             <p className="text-sm">Import media and add to timeline</p>
             <p className="text-xs text-gray-700 mt-1">Drop images here to add overlays</p>
-          </div>
-        )}
-
-        {noClipMessage && (
-          <div className="text-center text-gray-600 z-10 pointer-events-none">
-            <p className="text-xs">{noClipMessage}</p>
           </div>
         )}
       </div>

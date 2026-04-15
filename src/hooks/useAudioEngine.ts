@@ -36,8 +36,12 @@ export function useAudioEngine() {
   }, []);
 
   useEffect(() => {
-    const unsub = useEditorStore.subscribe((state, prev) => {
-      const { clips, tracks, currentTime, isPlaying } = state;
+    let rafId = 0;
+    let pendingSync = false;
+
+    const doSync = () => {
+      pendingSync = false;
+      const { clips, tracks, currentTime, isPlaying } = useEditorStore.getState();
 
       const activeAudioClips = clips.filter((c) => {
         const clipEnd = c.offset + (c.end - c.start) / c.speed;
@@ -91,7 +95,8 @@ export function useAudioEngine() {
           el.onloadeddata = () => {
             const e = managed.get(clip.id);
             if (e) e.ready = true;
-            syncElement(el, clip, currentTime, vol, isPlaying);
+            const s = useEditorStore.getState();
+            syncElement(el, clip, s.currentTime, vol, s.isPlaying);
           };
         }
 
@@ -99,9 +104,19 @@ export function useAudioEngine() {
           syncElement(entry.element, clip, currentTime, vol, isPlaying);
         }
       }
+    };
+
+    const unsub = useEditorStore.subscribe(() => {
+      if (!pendingSync) {
+        pendingSync = true;
+        rafId = requestAnimationFrame(doSync);
+      }
     });
 
-    return unsub;
+    return () => {
+      unsub();
+      cancelAnimationFrame(rafId);
+    };
   }, []);
 }
 

@@ -7,14 +7,12 @@ import { Timeline } from './features/timeline/Timeline';
 import { PropertiesPanel } from './components/PropertiesPanel';
 import { ProjectDashboard } from './components/ProjectDashboard';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
-import { usePlaybackEngine } from './hooks/usePlaybackEngine';
 import { useAudioEngine } from './hooks/useAudioEngine';
 import { useAutoSave } from './hooks/useAutoSave';
 import { useEditorStore } from './store/editorStore';
 
 const App: React.FC = () => {
   useKeyboardShortcuts();
-  usePlaybackEngine();
   useAudioEngine();
   useAutoSave();
 
